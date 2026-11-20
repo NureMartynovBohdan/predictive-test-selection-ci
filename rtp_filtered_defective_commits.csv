@@ -1,0 +1,9 @@
+Project,Valid_Commits,Raw_Fail_Commits,Transition_Commits(pass->fail),Strict_Defective(no_matrix_flaky+transition),Matrix_Flaky_Pairs
+apache@sling,1206,678,342,342,0
+square@okhttp,2134,599,373,159,467
+SonarSource@sonarqube,2976,316,179,131,79
+l0rdn1kk0n@wicket-bootstrap,796,306,116,120,521
+CloudifySource@cloudify,4868,491,116,115,1
+deeplearning4j@deeplearning4j,833,493,106,103,7
+jOOQ@jOOQ,1225,369,29,31,12
+facebook@buck,721,290,33,31,45
