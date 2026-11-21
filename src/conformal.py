@@ -1,15 +1,42 @@
 """
-conformal.py — Change-Level Conformal Prediction
-=================================================
+conformal.py — Change-Level Conformal Prediction (v2)
+=====================================================
 Implements:
-  1. Global conformal threshold (lambda) with CMR guarantee <= alpha
-  2. Residual-risk adaptive rule with tau calibration
-  3. Cost-aware ordering (p̂ / duration)
+  1. Global conformal threshold (λ) with CMR guarantee ≤ α
+  2. Residual-risk adaptive rule with proper conformal τ calibration
+  3. Deterministic tie-breaking for reproducibility
+  4. Cost-aware ordering (p̂ / duration)
 """
+
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 from typing import Tuple
+
+
+# ---------------------------------------------------------------------------
+# Deterministic tie-breaking
+# ---------------------------------------------------------------------------
+
+def _deterministic_sort(
+    df: pd.DataFrame,
+    probs: np.ndarray,
+) -> pd.DataFrame:
+    """Sort by ``(-prob, test_name)`` for deterministic ordering.
+
+    Used in **both** calibration and test-time selection so that
+    ties (common after isotonic regression) are always broken
+    identically.
+    """
+    df = df.copy()
+    df["_prob"] = probs
+    df["_sort_key"] = df["testName"].astype(str) if "testName" in df.columns else ""
+    df = df.sort_values(
+        ["_prob", "_sort_key"],
+        ascending=[False, True],
+    )
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -20,18 +47,12 @@ def compute_conformal_scores(
     df: pd.DataFrame,
     probs: np.ndarray,
 ) -> np.ndarray:
-    """
-    For each defective commit in the calibration set compute:
-        S_c = max_{i in Failed(c)} p̂_{c,i}
+    """Non-conformity scores for defective commits in calibration set.
 
-    Parameters
-    ----------
-    df : DataFrame with columns ['commit_idx', 'label'] (calibration rows)
-    probs : calibrated probabilities aligned with df rows
+    For each defective commit *c*:
+        ``S_c = max_{i ∈ Failed(c)} p̂_{c,i}``
 
-    Returns
-    -------
-    scores : 1-D array of S_c values, one per defective commit in df
+    Returns 1-D array of S_c values, one per defective commit.
     """
     df = df.copy()
     df["_prob"] = probs
@@ -40,23 +61,19 @@ def compute_conformal_scores(
     for commit_idx, grp in df.groupby("commit_idx", sort=True):
         failed = grp[grp["label"] == 1]
         if len(failed) == 0:
-            continue  # not defective — skip
+            continue
         scores.append(failed["_prob"].max())
 
     return np.array(scores, dtype=float)
 
 
 def compute_global_threshold(scores: np.ndarray, alpha: float) -> float:
-    """
-    Given conformal scores S_{(1)} <= ... <= S_{(n)} and risk level alpha,
-    compute lambda = S_{(k)} where k = floor(alpha * (n + 1)).
-
-    If k < 1, return the minimum possible threshold (0.0) so all tests pass.
+    """Conformal threshold λ with ⌊α(n+1)⌋ correction.
 
     Parameters
     ----------
     scores : conformal scores from defective calibration commits
-    alpha  : allowed miss rate (e.g. 0.05, 0.10, 0.15, 0.20)
+    alpha  : allowed miss rate
 
     Returns
     -------
@@ -67,11 +84,11 @@ def compute_global_threshold(scores: np.ndarray, alpha: float) -> float:
     k = int(np.floor(alpha * (n + 1)))
 
     if k < 1:
-        return 0.0  # run everything
+        return 0.0
     if k > n:
         return float(scores_sorted[-1])
 
-    return float(scores_sorted[k - 1])  # 0-indexed: k-th smallest = index k-1
+    return float(scores_sorted[k - 1])
 
 
 def select_tests_global(
@@ -79,13 +96,7 @@ def select_tests_global(
     probs: np.ndarray,
     threshold: float,
 ) -> pd.DataFrame:
-    """
-    Select tests whose calibrated probability >= threshold.
-
-    Returns
-    -------
-    DataFrame (subset of df) with extra column '_prob'
-    """
+    """Select tests with p̂ ≥ threshold."""
     df = df.copy()
     df["_prob"] = probs
     return df[df["_prob"] >= threshold].copy()
@@ -96,17 +107,15 @@ def select_tests_global(
 # ---------------------------------------------------------------------------
 
 def _residual_risk(probs_sorted_desc: np.ndarray, j: int) -> float:
-    """
-    R(j) = 1 - prod_{i > j} (1 - p̂_{(i)})
-    probability that at least one of the remaining (not-yet-selected) tests
-    is a failure.
+    """R(j) = 1 − ∏_{i>j} (1 − p̂_{(i)})
 
-    j = number of tests already selected (0-based prefix).
+    Probability that at least one of the remaining (not-yet-selected)
+    tests would fail.  *j* is the number of tests already selected
+    (0-based prefix length).
     """
     remaining = probs_sorted_desc[j:]
     if len(remaining) == 0:
         return 0.0
-    # clip to avoid log(0)
     remaining_clipped = np.clip(remaining, 0.0, 1.0 - 1e-12)
     log_prod = np.sum(np.log1p(-remaining_clipped))
     return float(1.0 - np.exp(log_prod))
@@ -117,66 +126,68 @@ def compute_tau_residual(
     probs: np.ndarray,
     alpha: float,
 ) -> float:
-    """
-    Calibrate tau such that empirical CMR on calibration defective commits <= alpha.
+    """Calibrate τ via proper conformal quantile with (n+1) correction.
 
-    Strategy: binary search over tau in [0, 1].
-    For each defective commit we simulate the greedy selection and check
-    whether at least one label==1 test is captured.
+    For each defective commit in the calibration set:
+      1. Sort tests by ``(-prob, test_name)`` (deterministic tie-breaking).
+      2. Find ``j*`` = minimal prefix that includes at least one label==1
+         test.
+      3. Record ``R(j*−1)`` = residual risk *before* the ``j*``-th test
+         was added (the risk level that *triggered* including this test).
 
-    Parameters
-    ----------
-    df    : calibration DataFrame with 'commit_idx', 'label'
-    probs : calibrated probabilities aligned with df
-    alpha : target miss rate
+    Collect R values ``R_1 … R_n`` from *n* defective commits.
+    Sort ascending, then pick ``τ = R_{(k)}`` where ``k = ⌊α·(n+1)⌋``.
 
-    Returns
-    -------
-    tau : float
+    If k < 1  → τ = 0.0  (run all tests for every commit).
+    If k > n  → τ = R_{(n)}  (most permissive).
     """
     df = df.copy()
     df["_prob"] = probs
 
-    defective_commits = df.groupby("commit_idx").filter(
-        lambda g: g["label"].sum() > 0
-    )["commit_idx"].unique()
+    defective_commits = (
+        df.groupby("commit_idx")
+        .filter(lambda g: g["label"].sum() > 0)["commit_idx"]
+        .unique()
+    )
 
     if len(defective_commits) == 0:
         return 0.0
 
-    def empirical_cmr(tau: float) -> float:
-        misses = 0
-        for cid in defective_commits:
-            grp = df[df["commit_idx"] == cid].copy()
-            ps = grp["_prob"].values
-            labels = grp["label"].values
-            order = np.argsort(-ps)  # descending
-            ps_sorted = ps[order]
-            labels_sorted = labels[order]
-            # greedy selection
-            selected_labels = []
-            for j in range(len(ps_sorted)):
-                selected_labels.append(labels_sorted[j])
-                r = _residual_risk(ps_sorted, j + 1)
-                if r < tau:
-                    break
-            if sum(selected_labels) == 0:
-                misses += 1
-        return misses / len(defective_commits)
+    residual_risks: list[float] = []
 
-    # Binary search: find the LARGEST tau such that CMR <= alpha
-    lo, hi = 0.0, 1.0
-    best_tau = 0.0
-    for _ in range(40):
-        mid = (lo + hi) / 2.0
-        cmr = empirical_cmr(mid)
-        if cmr <= alpha:
-            best_tau = mid
-            lo = mid
-        else:
-            hi = mid
+    for cid in sorted(defective_commits):
+        grp = df[df["commit_idx"] == cid].copy()
+        grp = _deterministic_sort(grp, grp["_prob"].values)
+        ps = grp["_prob"].values
+        labels = grp["label"].values
 
-    return best_tau
+        # Find j*: minimal prefix capturing at least one label==1
+        j_star = None
+        for j in range(1, len(ps) + 1):
+            if labels[:j].sum() > 0:
+                j_star = j
+                break
+
+        if j_star is None:
+            continue
+
+        # R(j*-1) = residual risk BEFORE adding the j*-th test
+        r_before = _residual_risk(ps, j_star - 1)
+        residual_risks.append(r_before)
+
+    if not residual_risks:
+        return 0.0
+
+    residual_risks_sorted = np.sort(residual_risks)
+    n = len(residual_risks_sorted)
+    k = int(np.floor(alpha * (n + 1)))
+
+    if k < 1:
+        return 0.0
+    if k > n:
+        return float(residual_risks_sorted[-1])
+
+    return float(residual_risks_sorted[k - 1])
 
 
 def select_tests_residual(
@@ -184,24 +195,28 @@ def select_tests_residual(
     probs: np.ndarray,
     tau: float,
 ) -> pd.DataFrame:
-    """
-    For a single commit: greedily add tests (sorted desc by p̂)
-    until residual risk R(j) < tau.
+    """Greedy residual-risk selection for a *single* commit.
 
-    df should contain rows of ONE commit only (or use per-commit loop in caller).
+    Critical fix: check ``R(0) < τ`` **before** adding the first test.
+    If the commit looks safe (all probabilities very low), select 0 tests.
 
-    Returns DataFrame with selected rows + '_prob' and '_rank' columns.
+    Tests are sorted by ``(-prob, test_name)`` for deterministic ordering.
     """
-    df = df.copy()
-    df["_prob"] = probs
-    df = df.sort_values("_prob", ascending=False)
+    df = _deterministic_sort(df, probs)
     ps = df["_prob"].values
 
-    cutoff = len(ps)  # default: select all
-    for j in range(len(ps)):
-        r = _residual_risk(ps, j + 1)
+    # Check if residual risk is already below tau before selecting anything
+    r0 = _residual_risk(ps, 0)
+    if r0 < tau:
+        selected = df.iloc[:0].copy()
+        selected["_rank"] = []
+        return selected
+
+    cutoff = len(ps)
+    for j in range(1, len(ps) + 1):
+        r = _residual_risk(ps, j)
         if r < tau:
-            cutoff = j + 1
+            cutoff = j
             break
 
     selected = df.iloc[:cutoff].copy()
@@ -214,11 +229,7 @@ def select_tests_residual_all_commits(
     probs: np.ndarray,
     tau: float,
 ) -> pd.DataFrame:
-    """
-    Apply residual-risk selection to all commits in df.
-
-    Returns concatenated DataFrame of selected rows (preserving original index).
-    """
+    """Apply residual-risk selection per commit."""
     df = df.copy()
     df["_prob"] = probs
     parts = []
@@ -231,29 +242,23 @@ def select_tests_residual_all_commits(
 
 
 # ---------------------------------------------------------------------------
-# 3.  Cost-Aware Ordering (p̂ / duration)
+# 3.  Cost-Aware Ordering
 # ---------------------------------------------------------------------------
 
 def prioritize_cost_aware(
     selected_df: pd.DataFrame,
-    duration_col: str = "duration_mean",
+    duration_col: str = "duration_median_20",
     min_duration: float = 1e-3,
 ) -> pd.DataFrame:
-    """
-    Sort selected tests by p̂_i / max(duration, min_duration) descending.
-    This maximises expected bug detections per unit time (APFDc-optimal order).
-
-    Parameters
-    ----------
-    selected_df  : DataFrame with '_prob' and duration_col columns
-    duration_col : column containing expected test duration (seconds)
-    min_duration : floor to avoid division by zero
-
-    Returns
-    -------
-    DataFrame sorted by cost-aware priority, with '_priority' column added.
-    """
+    """Sort by p̂ / max(duration, ε) descending (APFDc-optimal order)."""
     df = selected_df.copy()
-    dur = df[duration_col].clip(lower=min_duration) if duration_col in df.columns else pd.Series(1.0, index=df.index)
+    # Support duration_median_20 or duration_mean
+    col = duration_col if duration_col in df.columns else ("duration_mean" if "duration_mean" in df.columns else None)
+    if col is not None:
+        dur = df[col].fillna(1.0).clip(lower=min_duration)
+    else:
+        dur = pd.Series(1.0, index=df.index)
+
     df["_priority"] = df["_prob"] / dur
-    return df.sort_values("_priority", ascending=False).reset_index(drop=True)
+    df["_sort_key"] = df["testName"].astype(str) if "testName" in df.columns else ""
+    return df.sort_values(["_priority", "_sort_key"], ascending=[False, True]).reset_index(drop=True)

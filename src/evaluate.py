@@ -1,18 +1,26 @@
 """
-evaluate.py — Metrics & Baseline Comparisons
-=============================================
+evaluate.py — Metrics & Baseline Comparisons (v2)
+==================================================
 Implements:
-  - CMR (Change Miss Rate)
+  - CMR  (Change Miss Rate)
   - Budget saved (% tests, % duration)
-  - TTFF (Time-To-First-Failure, normalized)
-  - APFDc (Average Percentage of Faults Detected with cost)
-  - Baseline selectors: fixed_threshold, random, recently_failed
+  - TTFF (cumulative actual duration to first failure)
+  - APFDc (standard cost-cognizant formula, no clip)
+  - Baselines: retest-all, top-k%, fixed threshold, random matched budget,
+               recently failed, naive residual risk, threshold by target recall
+  - Cost-aware prioritization comparison (probability order vs p/duration order)
   - compare_all_methods() aggregator
+
+NOTE: TTFF and APFDc are *conditional* metrics — computed only on
+detected defective commits.  They **must** always be reported
+alongside CMR (the fraction of defective commits missed entirely).
 """
+
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -23,18 +31,8 @@ def compute_cmr(
     df: pd.DataFrame,
     selected_mask: np.ndarray,
 ) -> float:
-    """
-    Change Miss Rate = fraction of defective commits where NO selected test
-    has label == 1.
-
-    Parameters
-    ----------
-    df            : test-set DataFrame with columns ['commit_idx', 'label']
-    selected_mask : boolean array aligned with df rows (True = selected)
-
-    Returns
-    -------
-    cmr : float in [0, 1]
+    """Change Miss Rate = fraction of defective commits where NO selected
+    test has ``label == 1``.
     """
     df = df.copy()
     df["_sel"] = selected_mask
@@ -42,32 +40,28 @@ def compute_cmr(
     defective_commits = df.groupby("commit_idx")["label"].transform("max")
     defective_df = df[defective_commits == 1]
 
-    if len(defective_df["commit_idx"].unique()) == 0:
+    unique_defective = defective_df["commit_idx"].unique()
+    if len(unique_defective) == 0:
         return 0.0
 
     misses = 0
-    for cid, grp in defective_df.groupby("commit_idx"):
+    for cid in unique_defective:
+        grp = defective_df[defective_df["commit_idx"] == cid]
         selected_and_failed = grp[grp["_sel"] & (grp["label"] == 1)]
         if len(selected_and_failed) == 0:
             misses += 1
 
-    return misses / len(defective_df["commit_idx"].unique())
+    return misses / len(unique_defective)
 
 
 def compute_budget_saved(
     df: pd.DataFrame,
     selected_mask: np.ndarray,
-    duration_col: str = "duration_mean",
+    duration_col: str = "actual_duration",
 ) -> Dict[str, float]:
-    """
-    Returns:
-      pct_tests_selected   : fraction of test-commit pairs selected
-      pct_duration_saved   : fraction of total expected duration NOT run
-      pct_duration_selected: fraction of total expected duration that IS run
-    """
+    """Budget usage: fraction of tests selected and duration saved."""
     n_total = len(df)
     n_selected = int(selected_mask.sum())
-
     pct_tests_selected = n_selected / n_total if n_total > 0 else 0.0
 
     if duration_col in df.columns:
@@ -89,91 +83,94 @@ def compute_budget_saved(
 
 def compute_ttff(
     df: pd.DataFrame,
-    order_col: str = "_rank",
+    duration_col: str = "actual_duration",
 ) -> float:
-    """
-    Time-To-First-Failure (TTFF) — per commit, normalized position of the
-    first label==1 test in the ordered execution list.
+    """Time-To-First-Failure — cumulative actual duration to first failure.
 
-    For each defective commit where at least one failure is selected:
-        ttff_c = rank_of_first_failure / total_selected_for_commit
-    Returns mean over all such commits. If no commit catches a failure, returns 1.0.
+    For each defective commit where ≥ 1 failure is selected:
+      * Tests are executed in ``_rank`` order.
+      * ``TTFF_c = Σ actual_duration`` for ranks 1 … r where *r* is the
+        rank of the **first** test with ``label == 1``.
 
-    Parameters
-    ----------
-    df       : DataFrame with ['commit_idx', 'label', order_col]
-               Only selected tests should be in this DataFrame.
-    order_col: column giving execution order (1-based rank within commit)
+    Returns mean TTFF (seconds) over all such commits, or ``NaN`` if
+    no failures were detected.
+
+    **Conditional metric** — always report alongside CMR.
     """
-    scores = []
+    scores: list[float] = []
     for cid, grp in df.groupby("commit_idx"):
         failures = grp[grp["label"] == 1]
         if len(failures) == 0:
             continue
-        total = len(grp)
-        first_rank = failures[order_col].min()
-        scores.append(first_rank / total if total > 0 else 1.0)
+        first_fail_rank = failures["_rank"].min()
+        tests_up_to = grp[grp["_rank"] <= first_fail_rank]
+        ttff_c = tests_up_to[duration_col].sum() if duration_col in tests_up_to.columns else float(first_fail_rank)
+        scores.append(float(ttff_c))
 
-    return float(np.mean(scores)) if scores else 1.0
+    return float(np.mean(scores)) if scores else float("nan")
 
 
 def compute_apfdc(
     df: pd.DataFrame,
-    order_col: str = "_rank",
-    duration_col: str = "duration_mean",
+    duration_col: str = "actual_duration",
 ) -> float:
+    """APFDc — standard cost-cognizant formula.
+
+    ``APFDc = 1 − Σ_{i=1}^{m} (C_i − t_i/2) / (m · T)``
+
+    where:
+      * ``C_i`` = cumulative actual duration up to and including the test
+        that detected fault *i*
+      * ``t_i`` = actual duration of that test
+      * ``m``   = number of distinct faults detected (failing tests found)
+      * ``T``   = total actual duration of all selected tests for this commit
+
+    Returns mean APFDc over all defective commits where ≥ 1 failure was
+    selected.  Does **not** clip to [0, 1].
+
+    Returns ``NaN`` if no failures detected.
+
+    **Conditional metric** — always report alongside CMR.
     """
-    APFDc — duration-weighted Average Percentage of Faults Detected.
-
-    For each defective commit, computes the area-under-detection-curve
-    weighted by test execution cost (duration).
-
-    APFDc_c = 1 - (sum_{failing test i} cost_i * rank_i) / (TF * TC) + 1/(2*TF)
-    where TF = number of failing tests, TC = total cost of selected tests.
-
-    Returns mean APFDc over all defective commits where at least one failure selected.
-    If none, returns 0.0.
-    """
-    scores = []
+    scores: list[float] = []
     for cid, grp in df.groupby("commit_idx"):
         failures = grp[grp["label"] == 1]
         if len(failures) == 0:
             continue
 
-        # cost per test (use 1 if duration missing)
-        if duration_col in grp.columns:
-            costs = grp[duration_col].fillna(1.0).clip(lower=1e-3).values
-        else:
-            costs = np.ones(len(grp))
+        grp_sorted = grp.sort_values("_rank")
+        durations = grp_sorted[duration_col].values if duration_col in grp_sorted.columns else np.ones(len(grp_sorted))
+        labels = grp_sorted["label"].values
 
-        total_cost = costs.sum()
-        tf = len(failures)
-        if total_cost == 0 or tf == 0:
+        T = durations.sum()
+        if T <= 0:
             continue
 
-        ranks = grp[order_col].values
-        fail_mask = (grp["label"] == 1).values
+        cum_dur = np.cumsum(durations)
+        fault_indices = np.where(labels == 1)[0]
+        m = len(fault_indices)
+        if m == 0:
+            continue
 
-        # sum of cost_i * rank_i for failing tests
-        weighted_sum = (costs[fail_mask] * ranks[fail_mask]).sum()
+        weighted_sum = 0.0
+        for fi in fault_indices:
+            C_i = cum_dur[fi]
+            t_i = durations[fi]
+            weighted_sum += (C_i - t_i / 2.0)
 
-        apfdc_c = 1.0 - weighted_sum / (tf * total_cost) + 1.0 / (2.0 * tf)
-        scores.append(np.clip(apfdc_c, 0.0, 1.0))
+        apfdc_c = 1.0 - weighted_sum / (m * T)
+        scores.append(apfdc_c)
 
-    return float(np.mean(scores)) if scores else 0.0
+    return float(np.mean(scores)) if scores else float("nan")
 
 
 # ---------------------------------------------------------------------------
 # Baseline Selectors
 # ---------------------------------------------------------------------------
 
-def _add_rank_within_commit(df: pd.DataFrame, sort_col: str, ascending: bool = False) -> pd.DataFrame:
-    """Add '_rank' column = rank within each commit group sorted by sort_col."""
-    df = df.copy()
-    df["_rank"] = df.groupby("commit_idx")[sort_col].rank(
-        method="first", ascending=ascending
-    ).astype(int)
-    return df
+def baseline_retest_all(df: pd.DataFrame) -> np.ndarray:
+    """Select all tests (100% budget)."""
+    return np.ones(len(df), dtype=bool)
 
 
 def baseline_fixed_threshold(
@@ -181,8 +178,50 @@ def baseline_fixed_threshold(
     probs: np.ndarray,
     threshold: float = 0.5,
 ) -> np.ndarray:
-    """Select tests with p̂ >= threshold (fixed, no conformal calibration)."""
+    """Select tests with p̂ ≥ threshold (no conformal calibration)."""
     return probs >= threshold
+
+
+def baseline_top_k_pct(
+    df: pd.DataFrame,
+    probs: np.ndarray,
+    k_pct: float,
+) -> np.ndarray:
+    """Select top k% of tests per commit by predicted probability."""
+    mask = np.zeros(len(df), dtype=bool)
+    df_work = df.copy()
+    df_work["_prob_bk"] = probs
+    df_work["_iloc"] = np.arange(len(df))
+    for cid, grp in df_work.groupby("commit_idx"):
+        n_sel = max(1, int(np.ceil(len(grp) * k_pct)))
+        top_idx = grp.nlargest(n_sel, "_prob_bk")["_iloc"].values.astype(int)
+        mask[top_idx] = True
+    return mask
+
+
+def baseline_random_matched_budget(
+    df: pd.DataFrame,
+    reference_mask: np.ndarray,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Random selection matching per-commit budget of reference method."""
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    mask = np.zeros(len(df), dtype=bool)
+    df_work = df.copy()
+    df_work["_ref"] = reference_mask
+    df_work["_iloc"] = np.arange(len(df))
+
+    for cid, grp in df_work.groupby("commit_idx"):
+        k = int(grp["_ref"].sum())
+        if k <= 0:
+            continue
+        idx_pool = grp["_iloc"].values.astype(int)
+        k = min(k, len(idx_pool))
+        chosen = rng.choice(idx_pool, size=k, replace=False)
+        mask[chosen] = True
+    return mask
 
 
 def baseline_random(
@@ -190,40 +229,66 @@ def baseline_random(
     pct: float = 0.5,
     rng: Optional[np.random.Generator] = None,
 ) -> np.ndarray:
-    """
-    Randomly select pct fraction of tests per commit.
-    pct is chosen to match a typical budget (e.g. 50%).
-    """
+    """Randomly select pct fraction of tests per commit."""
     if rng is None:
         rng = np.random.default_rng(42)
-    mask = pd.Series(False, index=df.index)
-    for cid, grp in df.groupby("commit_idx"):
-        idx = grp.index.tolist()
+    mask = np.zeros(len(df), dtype=bool)
+    df_work = df.copy()
+    df_work["_iloc"] = np.arange(len(df))
+    for cid, grp in df_work.groupby("commit_idx"):
+        idx = grp["_iloc"].values.astype(int)
         k = max(1, int(len(idx) * pct))
         chosen = rng.choice(idx, size=k, replace=False)
-        mask.loc[chosen] = True
-    return mask.values
+        mask[chosen] = True
+    return mask
 
 
 def baseline_recently_failed(
     df: pd.DataFrame,
     n_recent: int = 5,
 ) -> np.ndarray:
-    """
-    Select tests that failed in any of the last n_recent commits
-    (using 'last_fail_dist' feature: 1 means failed on previous commit).
-
-    Falls back to selecting top-50% by fail_rate_N if column missing.
-    """
+    """Select tests that failed in any of the last n_recent commits."""
     mask = np.zeros(len(df), dtype=bool)
     if "last_fail_dist" in df.columns:
-        # select tests that failed within the last n_recent commits
-        mask = (df["last_fail_dist"] <= n_recent) & (df["last_fail_dist"] > 0)
-        mask = mask.values
-    elif "fail_rate_N" in df.columns:
-        threshold = df["fail_rate_N"].median()
-        mask = (df["fail_rate_N"] >= threshold).values
+        mask = ((df["last_fail_dist"] <= n_recent) & (df["last_fail_dist"] > 0)).values
+    elif "fail_rate_20" in df.columns:
+        threshold = df["fail_rate_20"].median()
+        mask = (df["fail_rate_20"] >= threshold).values
     return mask
+
+
+def baseline_naive_residual(
+    df: pd.DataFrame,
+    probs: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    """Naive residual risk: τ = α directly (no conformal calibration)."""
+    from conformal import select_tests_residual_all_commits
+    sel = select_tests_residual_all_commits(df, probs, tau=alpha)
+    return df.index.isin(sel.index)
+
+
+def baseline_threshold_target_recall(
+    df_val: pd.DataFrame,
+    probs_val: np.ndarray,
+    df_test: pd.DataFrame,
+    probs_test: np.ndarray,
+    target_recall: float = 0.90,
+) -> np.ndarray:
+    """Find threshold on validation achieving target change-level recall,
+    then apply to test set.
+    """
+    thresholds = np.sort(np.unique(probs_val))
+    best_thr = 0.0
+    for thr in thresholds:
+        mask = probs_val >= thr
+        cmr = compute_cmr(df_val, mask)
+        recall = 1.0 - cmr
+        if recall >= target_recall:
+            best_thr = thr
+        else:
+            break
+    return probs_test >= best_thr
 
 
 # ---------------------------------------------------------------------------
@@ -235,32 +300,51 @@ def evaluate_selection(
     selected_mask: np.ndarray,
     method_name: str,
     alpha: float,
-    duration_col: str = "duration_mean",
+    duration_col: str = "actual_duration",
     prob_col: str = "_prob",
+    order_by: str = "prob",
+    est_duration_col: str = "duration_median_20",
 ) -> Dict[str, Any]:
-    """
-    Given a boolean selection mask, compute all metrics for one method.
+    """Compute all metrics for one method and one selection mask.
 
-    Returns a dict with all scalar metrics.
+    Parameters
+    ----------
+    order_by : str
+        "prob" for descending probability ordering,
+        "cost_aware" for descending (prob / estimated_duration) ordering.
     """
-    # Build execution order (by prob desc within commit, for selected rows)
-    df_sel = df.copy()
-    df_sel["_sel"] = selected_mask
-    df_sel["_prob"] = df_sel.get(prob_col, 0.0) if prob_col in df_sel.columns else 0.0
+    df_work = df.copy()
+    df_work["_sel"] = selected_mask
+    if prob_col not in df_work.columns:
+        df_work["_prob"] = 0.0
 
-    # Assign rank within each commit for selected tests (by prob desc)
-    df_selected = df_sel[df_sel["_sel"]].copy()
+    df_selected = df_work[df_work["_sel"]].copy()
     if len(df_selected) > 0 and "_prob" in df_selected.columns:
-        df_selected["_rank"] = df_selected.groupby("commit_idx")["_prob"].rank(
-            method="first", ascending=False
-        ).astype(int)
+        if order_by == "cost_aware":
+            # Priority = p / duration_est
+            col = est_duration_col if est_duration_col in df_selected.columns else "duration_mean"
+            if col in df_selected.columns:
+                dur_est = df_selected[col].fillna(1.0).clip(lower=1e-3)
+            else:
+                dur_est = pd.Series(1.0, index=df_selected.index)
+            df_selected["_ordering_key"] = df_selected["_prob"] / dur_est
+        else:
+            df_selected["_ordering_key"] = df_selected["_prob"]
+
+        sort_key = df_selected["testName"].astype(str) if "testName" in df_selected.columns else ""
+        df_selected["_sort_name"] = sort_key
+        df_selected = df_selected.sort_values(
+            ["commit_idx", "_ordering_key", "_sort_name"],
+            ascending=[True, False, True]
+        )
+        df_selected["_rank"] = df_selected.groupby("commit_idx").cumcount() + 1
     else:
         df_selected["_rank"] = 1
 
-    cmr = compute_cmr(df_sel, selected_mask)
-    budget = compute_budget_saved(df_sel, selected_mask, duration_col)
-    ttff = compute_ttff(df_selected) if len(df_selected) > 0 else 1.0
-    apfdc = compute_apfdc(df_selected, duration_col=duration_col) if len(df_selected) > 0 else 0.0
+    cmr = compute_cmr(df_work, selected_mask)
+    budget = compute_budget_saved(df_work, selected_mask, duration_col)
+    ttff = compute_ttff(df_selected, duration_col) if len(df_selected) > 0 else float("nan")
+    apfdc = compute_apfdc(df_selected, duration_col) if len(df_selected) > 0 else float("nan")
 
     return {
         "method": method_name,
@@ -273,6 +357,7 @@ def evaluate_selection(
         "apfdc": apfdc,
         "n_defective_commits": int(
             df[df["label"] == 1].groupby("commit_idx").ngroups
+            if "commit_idx" in df.columns else 0
         ),
         "n_total_pairs": len(df),
         "n_selected": int(selected_mask.sum()),
@@ -286,61 +371,71 @@ def compare_all_methods(
     tau_residual: float,
     alpha: float,
     rng: Optional[np.random.Generator] = None,
-    duration_col: str = "duration_mean",
+    duration_col: str = "actual_duration",
+    df_val: Optional[pd.DataFrame] = None,
+    probs_val: Optional[np.ndarray] = None,
+    top_k_budgets: Optional[List[float]] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Evaluate all methods on the test set for a given alpha.
+    """Evaluate all methods on the test set for a given alpha."""
+    from conformal import (
+        select_tests_global,
+        select_tests_residual_all_commits,
+    )
 
-    Parameters
-    ----------
-    df_test          : test-set DataFrame (commit_idx, label, features...)
-    probs_test       : calibrated probabilities for test rows
-    threshold_global : lambda from compute_global_threshold
-    tau_residual     : tau from compute_tau_residual
-    alpha            : risk level
-    rng              : random generator for baseline_random
+    results: list[Dict[str, Any]] = []
+    df_test_p = df_test.copy()
+    df_test_p["_prob"] = probs_test
 
-    Returns
-    -------
-    list of metric dicts, one per method
-    """
-    from conformal import select_tests_global, select_tests_residual_all_commits
+    # 1. Retest-all
+    mask_all = baseline_retest_all(df_test)
+    results.append(evaluate_selection(df_test_p, mask_all, "retest_all", alpha, duration_col))
 
-    results = []
-
-    # --- Global conformal ---
+    # 2. Global conformal (probability ordering)
     sel_global = select_tests_global(df_test, probs_test, threshold_global)
     mask_global = df_test.index.isin(sel_global.index)
-    df_test_with_prob = df_test.copy()
-    df_test_with_prob["_prob"] = probs_test
-    results.append(
-        evaluate_selection(df_test_with_prob, mask_global, "global_conformal", alpha, duration_col)
-    )
+    results.append(evaluate_selection(df_test_p, mask_global, "global_conformal", alpha, duration_col, order_by="prob"))
 
-    # --- Residual risk ---
-    sel_residual = select_tests_residual_all_commits(df_test, probs_test, tau_residual)
-    mask_residual = df_test.index.isin(sel_residual.index)
-    results.append(
-        evaluate_selection(df_test_with_prob, mask_residual, "residual_risk", alpha, duration_col)
-    )
+    # 3. Global conformal (cost-aware ordering: p / duration)
+    results.append(evaluate_selection(df_test_p, mask_global, "global_conformal_cost_aware", alpha, duration_col, order_by="cost_aware"))
 
-    # --- Fixed threshold (0.5) ---
+    # 4. Residual risk conformal (probability ordering)
+    sel_res = select_tests_residual_all_commits(df_test, probs_test, tau_residual)
+    mask_residual = df_test.index.isin(sel_res.index)
+    results.append(evaluate_selection(df_test_p, mask_residual, "residual_risk", alpha, duration_col, order_by="prob"))
+
+    # 5. Residual risk conformal (cost-aware ordering)
+    results.append(evaluate_selection(df_test_p, mask_residual, "residual_risk_cost_aware", alpha, duration_col, order_by="cost_aware"))
+
+    # 6. Naive residual risk (tau = alpha)
+    sel_naive = select_tests_residual_all_commits(df_test, probs_test, alpha)
+    mask_naive = df_test.index.isin(sel_naive.index)
+    results.append(evaluate_selection(df_test_p, mask_naive, "naive_residual", alpha, duration_col))
+
+    # 7. Fixed threshold 0.5
     mask_fixed = baseline_fixed_threshold(df_test, probs_test, threshold=0.5)
-    results.append(
-        evaluate_selection(df_test_with_prob, mask_fixed, "fixed_0.5", alpha, duration_col)
-    )
+    results.append(evaluate_selection(df_test_p, mask_fixed, "fixed_0.5", alpha, duration_col))
 
-    # --- Random (match global selection rate) ---
-    pct_sel = mask_global.mean() if mask_global.mean() > 0 else 0.5
-    mask_random = baseline_random(df_test, pct=float(pct_sel), rng=rng)
-    results.append(
-        evaluate_selection(df_test_with_prob, mask_random, "random", alpha, duration_col)
-    )
+    # 8. Top-k%
+    if top_k_budgets is None:
+        top_k_budgets = [0.10, 0.30, 0.50]
+    for k_pct in top_k_budgets:
+        mask_topk = baseline_top_k_pct(df_test, probs_test, k_pct)
+        label = f"top_{int(k_pct*100)}pct"
+        results.append(evaluate_selection(df_test_p, mask_topk, label, alpha, duration_col))
 
-    # --- Recently failed ---
+    # 9. Random matched budget (matches global conformal)
+    mask_rand = baseline_random_matched_budget(df_test, mask_global, rng=rng)
+    results.append(evaluate_selection(df_test_p, mask_rand, "random_matched", alpha, duration_col))
+
+    # 10. Recently failed
     mask_recent = baseline_recently_failed(df_test)
-    results.append(
-        evaluate_selection(df_test_with_prob, mask_recent, "recently_failed", alpha, duration_col)
-    )
+    results.append(evaluate_selection(df_test_p, mask_recent, "recently_failed", alpha, duration_col))
+
+    # 11. Threshold by target recall (if validation set provided)
+    if df_val is not None and probs_val is not None:
+        mask_tgt = baseline_threshold_target_recall(
+            df_val, probs_val, df_test, probs_test, target_recall=1.0 - alpha
+        )
+        results.append(evaluate_selection(df_test_p, mask_tgt, "threshold_target_recall", alpha, duration_col))
 
     return results

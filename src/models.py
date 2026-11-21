@@ -1,14 +1,13 @@
 """
-src/models.py
-=============
-LightGBM training, isotonic calibration, and chronological split utilities.
-
+src/models.py — LightGBM training, calibration, chronological splits (v2)
+==========================================================================
 Split strategy (strict chronological — no data leakage):
-  60% train | 20% calibration | 20% test
 
-The 20% calibration set is used for:
-  1. Isotonic regression probability calibration
-  2. Computing conformal scores (S_c) on defective commits
+  4-way split:   Train (50%)  →  ProbCalib (15%)  →  ConfCalib (15%)  →  Test (20%)
+
+  - **ProbCalib**: isotonic regression probability calibration
+  - **ConfCalib**: conformal score / τ computation
+  - These are **never** the same set.
 
 Random seeds are supported for multi-seed experiments (10–30 runs).
 """
@@ -16,11 +15,10 @@ Random seeds are supported for multi-seed experiments (10–30 runs).
 from __future__ import annotations
 
 import warnings
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.isotonic import IsotonicRegression
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -32,36 +30,108 @@ except ImportError:
     HAS_LGB = False
     print("[WARN] lightgbm not installed; model training unavailable.")
 
-from features import FEATURE_COLS
+
+# ---------------------------------------------------------------------------
+# 4-way chronological split (primary)
+# ---------------------------------------------------------------------------
+
+def chrono_split_4(
+    df: pd.DataFrame,
+    train_frac: float = 0.50,
+    prob_calib_frac: float = 0.15,
+    conf_calib_frac: float = 0.15,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split by ``commit_idx`` into 4 non-overlapping chronological blocks.
+
+    Returns ``(train, prob_calib, conf_calib, test)``.
+
+    All rows with the same ``commit_idx`` go entirely into ONE split.
+    ``ProbCalib`` is used for isotonic regression; ``ConfCalib`` for
+    conformal thresholds.  They must **never** overlap.
+    """
+    commit_indices = sorted(df["commit_idx"].unique())
+    n = len(commit_indices)
+
+    n_train = int(np.floor(n * train_frac))
+    n_prob  = int(np.floor(n * (train_frac + prob_calib_frac)))
+    n_conf  = int(np.floor(n * (train_frac + prob_calib_frac + conf_calib_frac)))
+
+    train_commits = set(commit_indices[:n_train])
+    prob_commits  = set(commit_indices[n_train:n_prob])
+    conf_commits  = set(commit_indices[n_prob:n_conf])
+    test_commits  = set(commit_indices[n_conf:])
+
+    train = df[df["commit_idx"].isin(train_commits)].copy()
+    prob  = df[df["commit_idx"].isin(prob_commits)].copy()
+    conf  = df[df["commit_idx"].isin(conf_commits)].copy()
+    test  = df[df["commit_idx"].isin(test_commits)].copy()
+
+    return train, prob, conf, test
 
 
 # ---------------------------------------------------------------------------
-# Chronological split
+# Legacy 3-way split (deprecated)
 # ---------------------------------------------------------------------------
 
 def chrono_split(
     df: pd.DataFrame,
     train_frac: float = 0.60,
     calib_frac: float = 0.20,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """**DEPRECATED** — use ``chrono_split_4`` instead.
+
+    Split by ``commit_idx`` into (train, calib, test).
     """
-    Split by commit_idx (chronological). Returns (train, calib, test).
-    All rows with the same commit_idx go entirely into ONE split.
-    """
+    warnings.warn(
+        "chrono_split is deprecated; use chrono_split_4 for proper "
+        "separation of isotonic and conformal calibration.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     commit_indices = sorted(df["commit_idx"].unique())
     n = len(commit_indices)
     n_train = int(np.floor(n * train_frac))
     n_calib = int(np.floor(n * (train_frac + calib_frac)))
 
-    train_commits = set(commit_indices[:n_train])
-    calib_commits = set(commit_indices[n_train:n_calib])
-    test_commits  = set(commit_indices[n_calib:])
-
-    train = df[df["commit_idx"].isin(train_commits)].copy()
-    calib = df[df["commit_idx"].isin(calib_commits)].copy()
-    test  = df[df["commit_idx"].isin(test_commits)].copy()
-
+    train = df[df["commit_idx"].isin(set(commit_indices[:n_train]))].copy()
+    calib = df[df["commit_idx"].isin(set(commit_indices[n_train:n_calib]))].copy()
+    test  = df[df["commit_idx"].isin(set(commit_indices[n_calib:]))].copy()
     return train, calib, test
+
+
+# ---------------------------------------------------------------------------
+# Rolling / expanding splits
+# ---------------------------------------------------------------------------
+
+def rolling_time_splits(
+    df: pd.DataFrame,
+    n_splits: int = 3,
+    min_train_frac: float = 0.30,
+    prob_calib_frac: float = 0.15,
+    conf_calib_frac: float = 0.15,
+    test_frac: float = 0.20,
+) -> List[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    """Generate multiple chronological splits using expanding windows.
+
+    Each split uses a progressively larger training set while keeping
+    ``prob_calib``, ``conf_calib`` and ``test`` fractions constant.
+    """
+    commit_indices = sorted(df["commit_idx"].unique())
+    n = len(commit_indices)
+    needed = prob_calib_frac + conf_calib_frac + test_frac
+    if min_train_frac + needed > 1.0:
+        raise ValueError("Fractions exceed 1.0")
+
+    splits = []
+    available_train = 1.0 - needed  # max fraction for training
+    step = (available_train - min_train_frac) / max(n_splits - 1, 1) if n_splits > 1 else 0
+
+    for i in range(n_splits):
+        t_frac = min_train_frac + step * i
+        result = chrono_split_4(df, t_frac, prob_calib_frac, conf_calib_frac)
+        splits.append(result)
+
+    return splits
 
 
 # ---------------------------------------------------------------------------
@@ -70,20 +140,21 @@ def chrono_split(
 
 def train_lgbm(
     train: pd.DataFrame,
+    feature_cols: List[str],
     seed: int = 42,
     n_estimators: int = 400,
     num_leaves: int = 63,
     learning_rate: float = 0.05,
     min_child_samples: int = 10,
 ) -> "lgb.LGBMClassifier":
-    """
-    Train a LightGBM classifier on the training split.
-    Uses scale_pos_weight to handle extreme class imbalance.
+    """Train a LightGBM classifier.
+
+    **Does NOT use** ``.fillna(0)`` — LightGBM handles ``NaN`` natively.
     """
     if not HAS_LGB:
         raise RuntimeError("lightgbm not installed")
 
-    X = train[FEATURE_COLS].fillna(0)
+    X = train[feature_cols]  # NO fillna
     y = train["label"]
 
     pos = int(y.sum())
@@ -111,12 +182,10 @@ def train_lgbm(
 def calibrate_isotonic(
     model,
     calib: pd.DataFrame,
+    feature_cols: List[str],
 ) -> IsotonicRegression:
-    """
-    Fit an IsotonicRegression on calibration-set raw probabilities.
-    Returns the fitted isotonic regressor.
-    """
-    X_cal = calib[FEATURE_COLS].fillna(0)
+    """Fit IsotonicRegression on calibration-set raw probabilities."""
+    X_cal = calib[feature_cols]  # NO fillna
     y_cal = calib["label"]
 
     raw_probs = model.predict_proba(X_cal)[:, 1]
@@ -129,11 +198,10 @@ def predict_calibrated(
     model,
     iso: IsotonicRegression,
     df: pd.DataFrame,
+    feature_cols: List[str],
 ) -> np.ndarray:
-    """
-    Return calibrated probabilities for all rows in df.
-    """
-    X = df[FEATURE_COLS].fillna(0)
+    """Return calibrated probabilities for all rows in df."""
+    X = df[feature_cols]  # NO fillna
     raw = model.predict_proba(X)[:, 1]
     return iso.predict(raw)
 
@@ -148,41 +216,3 @@ def compute_pr_auc(labels: np.ndarray, probs: np.ndarray) -> float:
     if labels.sum() == 0:
         return 0.0
     return float(average_precision_score(labels, probs))
-
-
-if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-
-    from data_builder import load_project, load_patches
-    from features import build_features, FEATURE_COLS
-    import pandas as _pd
-
-    BASE = Path(__file__).parent.parent
-    RTP = BASE / "rtp-torrent"
-    proj = "apache@sling"
-
-    df_c = _pd.read_csv(RTP / "tr_all_built_commits.csv", dtype={"tr_job_id": "int64"})
-    j2c = dict(zip(df_c["tr_job_id"], df_c["git_commit_id"]))
-    df = load_project(proj, RTP, j2c)
-    patches = load_patches(proj, RTP)
-
-    print("Building features …")
-    feat = build_features(df, patches)
-
-    train, calib, test = chrono_split(feat)
-    print(f"train={len(train)} calib={len(calib)} test={len(test)}")
-    print(f"Positive rate: train={train['label'].mean():.4f} "
-          f"calib={calib['label'].mean():.4f} test={test['label'].mean():.4f}")
-
-    print("Training LightGBM …")
-    model = train_lgbm(train)
-
-    print("Calibrating …")
-    iso = calibrate_isotonic(model, calib)
-
-    probs_test = predict_calibrated(model, iso, test)
-    pr_auc = compute_pr_auc(test["label"].values, probs_test)
-    print(f"PR-AUC on test set: {pr_auc:.4f}")

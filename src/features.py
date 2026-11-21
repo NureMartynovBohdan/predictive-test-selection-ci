@@ -1,260 +1,354 @@
 """
-src/features.py
-===============
-Feature engineering for (commit, testName) pairs.
+src/features.py — Feature engineering (v2)
+==========================================
+Builds feature vectors for (commit, test) pairs using **only** the
+``CIHistorySimulator`` API — no direct data access.
 
 Feature groups (all computed from PAST data only — no data leakage):
 
-Group 1 — Test history (rolling window over past N commits where test ran):
-  - fail_rate_N      : fraction of past N appearances where test failed (strict)
-  - last_fail_dist   : commits since test last failed (strict), inf → −1
-  - duration_mean    : historical mean duration (seconds)
-  - run_count_total  : how many times this test has been seen before this commit
+Group 1 — Test history (multi-window):
+  fail_rate_5 / 20 / 50, new_failure_rate_50, new_failure_support,
+  last_fail_dist, last_observed_status, run_count_total,
+  duration_median_20, duration_p90_20, duration_history_known
 
-Group 2 — Commit characteristics:
-  - n_changed_files  : number of files touched in this commit's patch
-  - has_java         : at least one .java file changed (bool → int)
-  - has_test_file    : at least one file with "test" in name changed (bool → int)
-  - has_xml          : at least one .xml file changed (bool → int)
-  - has_build_file   : pom.xml / build.gradle / BUILD changed
+Group 2 — Parent status:
+  parent_status_code, parent_result_known
 
-Group 3 — Test ↔ Commit coupling (key features):
-  - path_min_dist    : min Jaccard distance between test-class path tokens
-                       and each changed file path tokens
-  - path_max_overlap : max fraction of test-path tokens covered by any changed file
-  - co_fail_rate     : historical fraction of commits where the same changed files
-                       co-occurred with this test failing (approximated as ratio
-                       of co-failure events to total commits with this test seen)
+Group 3 — Commit characteristics:
+  n_changed_files, lines_added, lines_deleted,
+  n_prod_files_changed, n_test_files_changed,
+  has_java, has_xml, has_build_file
+
+Group 4 — Test ↔ Commit coupling:
+  test_file_changed, same_package_changed, same_module_changed,
+  path_min_dist, path_max_overlap, co_fail_rate, co_fail_support
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Set, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 
+if TYPE_CHECKING:
+    from simulator import CIHistorySimulator, TestRun
+
 # ---------------------------------------------------------------------------
-# Helpers — path tokenisation
+# Helpers — path / name tokenisation
 # ---------------------------------------------------------------------------
 
-def _tokenise_java_class(class_name: str) -> list[str]:
-    """
-    'com.example.foo.BarTest' → ['com', 'example', 'foo', 'BarTest']
-    'com/example/foo/BarTest.java' → same
+_CAMEL_RE = re.compile(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _split_camel(name: str) -> List[str]:
+    """Split CamelCase: 'FooBarTest' → ['Foo', 'Bar', 'Test']."""
+    return _CAMEL_RE.sub(" ", name).split()
+
+
+def _tokenise_java_class(class_name: str) -> Set[str]:
+    """Tokenise a Java class name into a set of lower-case tokens.
+
+    ``'com.example.foo.FooBarTest'``
+      → ``{'com', 'example', 'foo', 'bar', 'test'}``
     """
     class_name = re.sub(r"\.java$", "", class_name, flags=re.I)
-    # Replace dots that look like package separators (between lower-case tokens)
-    tokens = re.split(r"[./\\]", class_name)
-    # Further split CamelCase for broader coverage (optional)
-    return [t.lower() for t in tokens if t]
+    parts = re.split(r"[./\\]", class_name)
+    tokens: list[str] = []
+    for p in parts:
+        tokens.extend(_split_camel(p))
+    return set(t.lower() for t in tokens if t)
 
 
-def _tokenise_path(path: str) -> set[str]:
-    tokens = re.split(r"[./\\]", path.lower())
-    return set(t for t in tokens if t)
+def _tokenise_path(path: str) -> Set[str]:
+    """Tokenise a file path into lower-case tokens (with CamelCase split)."""
+    # Remove extension
+    stem = re.sub(r"\.[^./\\]+$", "", path)
+    parts = re.split(r"[./\\]", stem)
+    tokens: list[str] = []
+    for p in parts:
+        tokens.extend(_split_camel(p))
+    return set(t.lower() for t in tokens if t)
 
 
-def _jaccard(a: set, b: set) -> float:
+def _jaccard_distance(a: Set[str], b: Set[str]) -> float:
     if not a or not b:
-        return 1.0  # maximum distance when one is empty
+        return 1.0
     inter = len(a & b)
     union = len(a | b)
-    return 1.0 - inter / union  # distance (0 = identical, 1 = disjoint)
+    return 1.0 - inter / union
 
 
-def _overlap_fraction(test_tokens: set, file_tokens: set) -> float:
-    """Fraction of test_tokens covered by file_tokens."""
+def _overlap_fraction(test_tokens: Set[str], file_tokens: Set[str]) -> float:
     if not test_tokens:
         return 0.0
     return len(test_tokens & file_tokens) / len(test_tokens)
 
 
+def _java_package(class_name: str) -> str:
+    """Extract Java package: 'com.example.Foo' → 'com.example'."""
+    class_name = re.sub(r"\.java$", "", class_name, flags=re.I)
+    parts = class_name.rsplit(".", 1)
+    return parts[0] if len(parts) > 1 else ""
+
+
+def _file_package(path: str) -> str:
+    """Approximate Java package from file path."""
+    # e.g. src/main/java/com/example/Foo.java → com/example
+    path = path.replace("\\", "/")
+    # Try to find after /java/
+    idx = path.find("/java/")
+    if idx >= 0:
+        rest = path[idx + 6:]
+    else:
+        rest = path
+    rest = re.sub(r"\.[^/]+$", "", rest)
+    parts = rest.rsplit("/", 1)
+    return parts[0] if len(parts) > 1 else ""
+
+
+def _file_module(path: str) -> str:
+    """Approximate module from path: first directory component."""
+    path = path.replace("\\", "/").strip("/")
+    return path.split("/")[0] if "/" in path else ""
+
+
+def _is_test_file(path: str) -> bool:
+    """Heuristic: file path likely contains a test."""
+    lower = path.lower()
+    return "test" in lower or "spec" in lower
+
+
 # ---------------------------------------------------------------------------
-# Main feature-engineering function
+# Main feature-engineering functions
 # ---------------------------------------------------------------------------
 
 def build_features(
-    df: pd.DataFrame,
-    patches: dict[str, list[str]],
-    history_window: int = 20,
+    simulator: "CIHistorySimulator",
+    commit_sha: str,
 ) -> pd.DataFrame:
-    """
-    Parameters
-    ----------
-    df : DataFrame from data_builder.load_project()
-         Required columns: commit, testName, commit_idx, commit_failed_strict,
-                           any_fail, intra_commit_flaky, duration_mean, label
-    patches : {sha: [file_path, ...]}
-    history_window : number of past appearances to use for rolling stats
+    """Build feature vectors for all candidate tests on one commit.
 
-    Returns
-    -------
-    DataFrame with original columns PLUS feature columns and 'label'.
-    Rows are sorted by commit_idx.
-    """
-    df = df.sort_values(["commit_idx", "testName"]).copy()
+    Uses ``simulator`` API exclusively — no direct data access.
 
-    # Map commit → list of changed files
-    df["changed_files"] = df["commit"].map(patches).apply(
-        lambda x: x if isinstance(x, list) else []
+    Returns a DataFrame with one row per (commit, test) containing
+    feature columns.  Does **not** include ``label`` or
+    ``actual_duration`` (those come from ``reveal_ground_truth``).
+    """
+    ctx = simulator.get_decision_context(commit_sha)
+    as_of = simulator.get_commit_order(commit_sha)
+    # Use min job_id of this commit as the temporal cut-off for history
+    as_of_job = simulator._commit_min_job.get(commit_sha, as_of)
+
+    changed_files = ctx.changed_files
+    n_changed = ctx.n_changed_files
+
+    # Pre-compute commit-level features (Group 3)
+    has_java = int(any(f.endswith(".java") for f in changed_files))
+    has_xml  = int(any(f.endswith(".xml") for f in changed_files))
+    has_build = int(any(
+        Path(f).name.lower() in {"pom.xml", "build.gradle", "build.gradle.kts", "build"}
+        for f in changed_files
+    ))
+    n_test_files = sum(1 for f in changed_files if _is_test_file(f))
+    n_prod_files = n_changed - n_test_files
+
+    # Tokenise changed files (for coupling features)
+    file_token_sets = [_tokenise_path(f) for f in changed_files]
+    file_packages = [_file_package(f) for f in changed_files]
+    file_modules  = set(_file_module(f) for f in changed_files)
+    file_names_lower = set(
+        Path(f).stem.lower() for f in changed_files
     )
 
-    # Pre-tokenise test names
-    test_tokens_cache: dict[str, set] = {}
-    def get_test_tokens(name: str) -> set:
-        if name not in test_tokens_cache:
-            test_tokens_cache[name] = set(_tokenise_java_class(name))
-        return test_tokens_cache[name]
+    rows: list[dict] = []
 
-    # ---------------------------------------------------------------------------
-    # Group 1 & 3 rolling-history features (computed per test, chronologically)
-    # ---------------------------------------------------------------------------
-    rows_out = []
+    for test_name in ctx.candidate_tests:
+        # --- History (Group 1) ---
+        history = simulator.get_test_history(test_name, as_of_job)
+        n_past = len(history)
 
-    # Collect test-level history incrementally
-    # history[testName] = list of (commit_idx, commit_failed_strict) in seen order
-    test_history: dict[str, list[tuple[int, bool, float]]] = {}  # (idx, failed, dur)
+        # Multi-window fail rates
+        def _fail_rate(window: List) -> float:
+            if not window:
+                return 0.0
+            return sum(1 for r in window if r.failed) / len(window)
 
-    # Also track (testName, file_set) co-occurrence for Group 3
-    # co_fail_map[testName][frozenset(changed_files)] = (total_commits_seen, fail_count)
-    # Too memory-heavy to track per-file-set; use simpler "any shared token" heuristic
-    # co_fail_map[testName] = {commit_idx: (changed_files, failed)}
-    test_commit_history: dict[str, list[dict]] = {}
+        fail_rate_5 = _fail_rate(history[-5:]) if history else 0.0
+        fail_rate_20 = _fail_rate(history[-20:]) if history else 0.0
+        fail_rate_50 = _fail_rate(history[-50:]) if history else 0.0
 
-    for _, row in df.iterrows():
-        test = row["testName"]
-        c_idx = int(row["commit_idx"])
-        commit = row["commit"]
-        strict_fail = bool(row["commit_failed_strict"])
-        dur = float(row["duration_mean"]) if not pd.isna(row["duration_mean"]) else 0.0
-        changed = row["changed_files"]
+        # New failure rate (transitions in past 50)
+        window_50 = history[-50:]
+        new_fail_count = 0
+        for i in range(1, len(window_50)):
+            if window_50[i].failed and window_50[i - 1].passed:
+                new_fail_count += 1
+        new_failure_rate_50 = new_fail_count / max(len(window_50) - 1, 1) if len(window_50) > 1 else 0.0
+        new_failure_support = new_fail_count
 
-        # --- Retrieve past history (before this commit) ---
-        past = test_history.get(test, [])  # [(idx, failed, dur), ...]
-        past_commit_hist = test_commit_history.get(test, [])
-
-        # Group 1 features
-        n_past = len(past)
-        window = past[-history_window:] if past else []
-
-        fail_rate_N = sum(1 for _, f, _ in window if f) / max(len(window), 1)
-        last_failed_indices = [i for i, (idx, f, _) in enumerate(past) if f]
-        if last_failed_indices:
-            last_seen_idx = past[last_failed_indices[-1]][0]
-            last_fail_dist = c_idx - last_seen_idx
+        # Last fail distance
+        last_fail_indices = [i for i, r in enumerate(history) if r.failed]
+        if last_fail_indices:
+            last_fail_order = history[last_fail_indices[-1]].job_order
+            last_fail_dist = as_of_job - last_fail_order
         else:
-            last_fail_dist = -1  # Never failed before
+            last_fail_dist = -1
 
-        dur_hist = np.mean([d for _, _, d in past]) if past else dur
-        run_count_total = n_past
+        # Last observed status
+        last_observed = history[-1].failed if history else -1
+        last_observed_status = int(last_observed) if isinstance(last_observed, bool) else -1
 
-        # Group 2 — Commit characteristics
-        n_changed = len(changed)
-        has_java = int(any(f.endswith(".java") for f in changed))
-        has_test_file = int(any("test" in f.lower() for f in changed))
-        has_xml = int(any(f.endswith(".xml") for f in changed))
-        has_build_file = int(any(
-            Path(f).name.lower() in {"pom.xml", "build.gradle", "build"}
-            for f in changed
-        ))
+        # Duration history
+        if history:
+            durs = [r.duration for r in history[-20:] if r.duration > 0]
+            duration_median_20 = float(np.median(durs)) if durs else np.nan
+            duration_p90_20 = float(np.percentile(durs, 90)) if durs else np.nan
+            duration_history_known = 1
+        else:
+            duration_median_20 = np.nan
+            duration_p90_20 = np.nan
+            duration_history_known = 0
 
-        # Group 3 — Test ↔ file coupling
-        test_toks = get_test_tokens(test)
+        # --- Parent status (Group 2) ---
+        parent_status = simulator.get_parent_test_status(
+            ctx.parent_sha, test_name, as_of_job
+        )
+        parent_status_code = {
+            "pass": 0, "fail": 1, "unknown": -1
+        }.get(parent_status.value, -1)
+        parent_result_known = 1 if parent_status.value != "unknown" else 0
 
-        if changed:
-            file_tok_sets = [_tokenise_path(f) for f in changed]
-            dists = [_jaccard(test_toks, ft) for ft in file_tok_sets]
+        # --- Coupling (Group 4) ---
+        test_tokens = _tokenise_java_class(test_name)
+        test_package = _java_package(test_name)
+        test_class_lower = test_name.rsplit(".", 1)[-1].lower() if "." in test_name else test_name.lower()
+        test_module = ""  # Will check against file modules
+
+        # test_file_changed: exact test class name in changed files
+        test_file_changed = int(test_class_lower in file_names_lower)
+
+        # same_package_changed
+        same_package = int(any(
+            _file_package(f).replace("/", ".") == test_package
+            or _file_package(f) == test_package.replace(".", "/")
+            for f in changed_files
+        )) if test_package and changed_files else 0
+
+        # same_module_changed
+        same_module = 0
+        # Try to infer test module from class name or history
+        if file_modules and changed_files:
+            # Heuristic: check if any token from first package segment matches a file module
+            pkg_parts = test_package.split(".") if test_package else []
+            if pkg_parts:
+                same_module = int(any(p.lower() in file_modules for p in pkg_parts[:2]))
+
+        # Jaccard / overlap
+        if file_token_sets:
+            dists = [_jaccard_distance(test_tokens, ft) for ft in file_token_sets]
             path_min_dist = min(dists)
-            overlaps = [_overlap_fraction(test_toks, ft) for ft in file_tok_sets]
+            overlaps = [_overlap_fraction(test_tokens, ft) for ft in file_token_sets]
             path_max_overlap = max(overlaps)
         else:
             path_min_dist = 1.0
             path_max_overlap = 0.0
 
-        # Co-fail rate: among past commits where THIS test ran AND the current
-        # changed-file set overlaps with what was changed then, how often did it fail?
-        if past_commit_hist and changed:
-            curr_set = set(changed)
-            co_seen, co_fail = 0, 0
-            for rec in past_commit_hist[-50:]:  # limit lookback
-                overlap = curr_set & set(rec["changed"])
-                if overlap:
+        # Co-fail rate (from history)
+        co_seen, co_fail = 0, 0
+        if history and changed_files:
+            curr_set = set(changed_files)
+            # Look at past commits where this test ran
+            seen_commits: dict[str, list] = {}
+            for r in history[-50:]:
+                seen_commits.setdefault(r.commit_sha, []).append(r)
+            for past_sha, past_runs in seen_commits.items():
+                past_files = simulator._patches.get(past_sha, [])
+                if set(past_files) & curr_set:
                     co_seen += 1
-                    if rec["failed"]:
+                    if any(r.failed for r in past_runs):
                         co_fail += 1
-            co_fail_rate = co_fail / co_seen if co_seen > 0 else 0.0
-        else:
-            co_fail_rate = 0.0
+        co_fail_rate = co_fail / co_seen if co_seen > 0 else 0.0
+        co_fail_support = co_seen
 
-        rows_out.append({
-            # identifiers
-            "commit": commit,
-            "commit_idx": c_idx,
-            "testName": test,
-            "label": int(row["label"]),
-            # group 1
-            "fail_rate_N": fail_rate_N,
+        rows.append({
+            # Identifiers (not features)
+            "commit": commit_sha,
+            "commit_idx": ctx.commit_order,
+            "testName": test_name,
+            # Group 1 — test history
+            "fail_rate_5": fail_rate_5,
+            "fail_rate_20": fail_rate_20,
+            "fail_rate_50": fail_rate_50,
+            "new_failure_rate_50": new_failure_rate_50,
+            "new_failure_support": new_failure_support,
             "last_fail_dist": last_fail_dist,
-            "duration_mean": dur_hist,
-            "run_count_total": run_count_total,
-            # group 2
+            "last_observed_status": last_observed_status,
+            "run_count_total": n_past,
+            "duration_median_20": duration_median_20,
+            "duration_p90_20": duration_p90_20,
+            "duration_history_known": duration_history_known,
+            # Group 2 — parent status
+            "parent_status_code": parent_status_code,
+            "parent_result_known": parent_result_known,
+            # Group 3 — commit characteristics
             "n_changed_files": n_changed,
+            "lines_added": 0,       # Not available in RTPTorrent
+            "lines_deleted": 0,     # Not available in RTPTorrent
+            "n_prod_files_changed": n_prod_files,
+            "n_test_files_changed": n_test_files,
             "has_java": has_java,
-            "has_test_file": has_test_file,
             "has_xml": has_xml,
-            "has_build_file": has_build_file,
-            # group 3
+            "has_build_file": has_build,
+            # Group 4 — coupling
+            "test_file_changed": test_file_changed,
+            "same_package_changed": same_package,
+            "same_module_changed": same_module,
             "path_min_dist": path_min_dist,
             "path_max_overlap": path_max_overlap,
             "co_fail_rate": co_fail_rate,
-            # carry-through for conformal / evaluation
-            "commit_failed_strict": strict_fail,
-            "intra_commit_flaky": bool(row["intra_commit_flaky"]),
-            "changed_files": changed,
+            "co_fail_support": co_fail_support,
         })
 
-        # Update incremental history AFTER computing features (no leakage)
-        if test not in test_history:
-            test_history[test] = []
-        test_history[test].append((c_idx, strict_fail, dur))
+    return pd.DataFrame(rows)
 
-        if test not in test_commit_history:
-            test_commit_history[test] = []
-        test_commit_history[test].append({
-            "commit_idx": c_idx,
-            "changed": changed,
-            "failed": strict_fail,
-        })
 
-    return pd.DataFrame(rows_out)
+def build_features_batch(
+    simulator: "CIHistorySimulator",
+    commit_shas: List[str],
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """Build features for multiple commits."""
+    parts: list[pd.DataFrame] = []
+    for i, sha in enumerate(commit_shas):
+        if verbose and (i + 1) % 100 == 0:
+            print(f"  features: {i+1}/{len(commit_shas)}", flush=True)
+        parts.append(build_features(simulator, sha))
+    if parts:
+        return pd.concat(parts, ignore_index=True)
+    return pd.DataFrame()
 
+
+# ---------------------------------------------------------------------------
+# Feature column list (for model training)
+# ---------------------------------------------------------------------------
 
 FEATURE_COLS = [
-    "fail_rate_N", "last_fail_dist", "duration_mean", "run_count_total",
-    "n_changed_files", "has_java", "has_test_file", "has_xml", "has_build_file",
-    "path_min_dist", "path_max_overlap", "co_fail_rate",
+    # Group 1 — test history
+    "fail_rate_5", "fail_rate_20", "fail_rate_50",
+    "new_failure_rate_50", "new_failure_support",
+    "last_fail_dist", "last_observed_status", "run_count_total",
+    "duration_median_20", "duration_p90_20", "duration_history_known",
+    # Group 2 — parent status
+    "parent_status_code", "parent_result_known",
+    # Group 3 — commit characteristics
+    "n_changed_files", "lines_added", "lines_deleted",
+    "n_prod_files_changed", "n_test_files_changed",
+    "has_java", "has_xml", "has_build_file",
+    # Group 4 — coupling
+    "test_file_changed", "same_package_changed", "same_module_changed",
+    "path_min_dist", "path_max_overlap",
+    "co_fail_rate", "co_fail_support",
 ]
-
-
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-    from data_builder import load_project, load_patches, BEST_PROJECTS
-    from pathlib import Path as P
-
-    BASE = P(__file__).parent.parent
-    RTP = BASE / "rtp-torrent"
-
-    proj = "apache@sling"
-    commits_csv = RTP / "tr_all_built_commits.csv"
-    df_c = __import__("pandas").read_csv(commits_csv, dtype={"tr_job_id": "int64"})
-    j2c = dict(zip(df_c["tr_job_id"], df_c["git_commit_id"]))
-
-    df = load_project(proj, RTP, j2c)
-    patches = load_patches(proj, RTP)
-    feat_df = build_features(df, patches)
-    print(feat_df[FEATURE_COLS + ["label"]].describe())
-    print("label distribution:", feat_df["label"].value_counts().to_dict())
