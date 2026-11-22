@@ -245,15 +245,23 @@ def baseline_random(
 
 def baseline_recently_failed(
     df: pd.DataFrame,
-    n_recent: int = 5,
+    n_recent: int = 20,
 ) -> np.ndarray:
-    """Select tests that failed in any of the last n_recent commits."""
+    """Select tests that failed recently in the historical window.
+
+    Prefers fail_rate_20 > 0 (or fail_rate_50 > 0), falling back to
+    last_fail_dist > 0 if fail-rate columns are absent.
+    """
     mask = np.zeros(len(df), dtype=bool)
-    if "last_fail_dist" in df.columns:
+    if "fail_rate_20" in df.columns:
+        mask = (df["fail_rate_20"] > 0).values
+        # If fail_rate_20 selects nothing across the dataset, fallback to fail_rate_50
+        if not mask.any() and "fail_rate_50" in df.columns:
+            mask = (df["fail_rate_50"] > 0).values
+    elif "fail_rate_50" in df.columns:
+        mask = (df["fail_rate_50"] > 0).values
+    elif "last_fail_dist" in df.columns:
         mask = ((df["last_fail_dist"] <= n_recent) & (df["last_fail_dist"] > 0)).values
-    elif "fail_rate_20" in df.columns:
-        threshold = df["fail_rate_20"].median()
-        mask = (df["fail_rate_20"] >= threshold).values
     return mask
 
 
@@ -304,6 +312,7 @@ def evaluate_selection(
     prob_col: str = "_prob",
     order_by: str = "prob",
     est_duration_col: str = "duration_median_20",
+    rng: Optional[np.random.Generator] = None,
 ) -> Dict[str, Any]:
     """Compute all metrics for one method and one selection mask.
 
@@ -311,7 +320,10 @@ def evaluate_selection(
     ----------
     order_by : str
         "prob" for descending probability ordering,
-        "cost_aware" for descending (prob / estimated_duration) ordering.
+        "cost_aware" for descending (prob / estimated_duration) ordering,
+        "default" for standard test/class name alphabetical ordering (unprioritized),
+        "random" for random execution order per commit,
+        "recently_failed" for execution order sorted by recency of failure (last_fail_dist).
     """
     df_work = df.copy()
     df_work["_sel"] = selected_mask
@@ -319,7 +331,10 @@ def evaluate_selection(
         df_work["_prob"] = 0.0
 
     df_selected = df_work[df_work["_sel"]].copy()
-    if len(df_selected) > 0 and "_prob" in df_selected.columns:
+    if len(df_selected) > 0:
+        sort_key = df_selected["testName"].astype(str) if "testName" in df_selected.columns else ""
+        df_selected["_sort_name"] = sort_key
+
         if order_by == "cost_aware":
             # Priority = p / duration_est
             col = est_duration_col if est_duration_col in df_selected.columns else "duration_mean"
@@ -328,15 +343,60 @@ def evaluate_selection(
             else:
                 dur_est = pd.Series(1.0, index=df_selected.index)
             df_selected["_ordering_key"] = df_selected["_prob"] / dur_est
+            df_selected = df_selected.sort_values(
+                ["commit_idx", "_ordering_key", "_sort_name"],
+                ascending=[True, False, True]
+            )
+        elif order_by == "default":
+            # Standard class/test name alphabetical order, independent of ML _prob
+            df_selected = df_selected.sort_values(
+                ["commit_idx", "_sort_name"],
+                ascending=[True, True]
+            )
+        elif order_by == "random":
+            # Random execution order per commit
+            gen = rng if rng is not None else np.random.default_rng(42)
+            df_selected["_rand_key"] = gen.random(len(df_selected))
+            df_selected = df_selected.sort_values(
+                ["commit_idx", "_rand_key"],
+                ascending=[True, True]
+            )
+        elif order_by == "recently_failed":
+            # Most recent failure first (last_fail_dist ascending, <=0 placed at the end)
+            if "last_fail_dist" in df_selected.columns:
+                dist = df_selected["last_fail_dist"].copy()
+                dist = dist.apply(lambda x: 1e9 if pd.isna(x) or x <= 0 else float(x))
+                df_selected["_dist_key"] = dist
+                if "fail_rate_20" in df_selected.columns:
+                    df_selected["_fr_key"] = df_selected["fail_rate_20"].fillna(0.0)
+                    df_selected = df_selected.sort_values(
+                        ["commit_idx", "_dist_key", "_fr_key", "_sort_name"],
+                        ascending=[True, True, False, True]
+                    )
+                else:
+                    df_selected = df_selected.sort_values(
+                        ["commit_idx", "_dist_key", "_sort_name"],
+                        ascending=[True, True, True]
+                    )
+            elif "fail_rate_20" in df_selected.columns:
+                df_selected["_fr_key"] = df_selected["fail_rate_20"].fillna(0.0)
+                df_selected = df_selected.sort_values(
+                    ["commit_idx", "_fr_key", "_sort_name"],
+                    ascending=[True, False, True]
+                )
+            else:
+                df_selected = df_selected.sort_values(
+                    ["commit_idx", "_sort_name"],
+                    ascending=[True, True]
+                )
         else:
+            # "prob" or fallback: descending probability
             df_selected["_ordering_key"] = df_selected["_prob"]
+            df_selected = df_selected.sort_values(
+                ["commit_idx", "_ordering_key", "_sort_name"],
+                ascending=[True, False, True]
+            )
 
-        sort_key = df_selected["testName"].astype(str) if "testName" in df_selected.columns else ""
-        df_selected["_sort_name"] = sort_key
-        df_selected = df_selected.sort_values(
-            ["commit_idx", "_ordering_key", "_sort_name"],
-            ascending=[True, False, True]
-        )
         df_selected["_rank"] = df_selected.groupby("commit_idx").cumcount() + 1
     else:
         df_selected["_rank"] = 1
@@ -386,34 +446,48 @@ def compare_all_methods(
     df_test_p = df_test.copy()
     df_test_p["_prob"] = probs_test
 
-    # 1. Retest-all
+    # 1. Retest-all (standard alphabetical execution order, no ML prioritization)
     mask_all = baseline_retest_all(df_test)
-    results.append(evaluate_selection(df_test_p, mask_all, "retest_all", alpha, duration_col))
+    results.append(evaluate_selection(
+        df_test_p, mask_all, "retest_all", alpha, duration_col, order_by="default"
+    ))
 
     # 2. Global conformal (probability ordering)
     sel_global = select_tests_global(df_test, probs_test, threshold_global)
     mask_global = df_test.index.isin(sel_global.index)
-    results.append(evaluate_selection(df_test_p, mask_global, "global_conformal", alpha, duration_col, order_by="prob"))
+    results.append(evaluate_selection(
+        df_test_p, mask_global, "global_conformal", alpha, duration_col, order_by="prob"
+    ))
 
     # 3. Global conformal (cost-aware ordering: p / duration)
-    results.append(evaluate_selection(df_test_p, mask_global, "global_conformal_cost_aware", alpha, duration_col, order_by="cost_aware"))
+    results.append(evaluate_selection(
+        df_test_p, mask_global, "global_conformal_cost_aware", alpha, duration_col, order_by="cost_aware"
+    ))
 
     # 4. Residual risk conformal (probability ordering)
     sel_res = select_tests_residual_all_commits(df_test, probs_test, tau_residual)
     mask_residual = df_test.index.isin(sel_res.index)
-    results.append(evaluate_selection(df_test_p, mask_residual, "residual_risk", alpha, duration_col, order_by="prob"))
+    results.append(evaluate_selection(
+        df_test_p, mask_residual, "residual_risk", alpha, duration_col, order_by="prob"
+    ))
 
     # 5. Residual risk conformal (cost-aware ordering)
-    results.append(evaluate_selection(df_test_p, mask_residual, "residual_risk_cost_aware", alpha, duration_col, order_by="cost_aware"))
+    results.append(evaluate_selection(
+        df_test_p, mask_residual, "residual_risk_cost_aware", alpha, duration_col, order_by="cost_aware"
+    ))
 
     # 6. Naive residual risk (tau = alpha)
     sel_naive = select_tests_residual_all_commits(df_test, probs_test, alpha)
     mask_naive = df_test.index.isin(sel_naive.index)
-    results.append(evaluate_selection(df_test_p, mask_naive, "naive_residual", alpha, duration_col))
+    results.append(evaluate_selection(
+        df_test_p, mask_naive, "naive_residual", alpha, duration_col, order_by="prob"
+    ))
 
     # 7. Fixed threshold 0.5
     mask_fixed = baseline_fixed_threshold(df_test, probs_test, threshold=0.5)
-    results.append(evaluate_selection(df_test_p, mask_fixed, "fixed_0.5", alpha, duration_col))
+    results.append(evaluate_selection(
+        df_test_p, mask_fixed, "fixed_0.5", alpha, duration_col, order_by="prob"
+    ))
 
     # 8. Top-k%
     if top_k_budgets is None:
@@ -421,21 +495,29 @@ def compare_all_methods(
     for k_pct in top_k_budgets:
         mask_topk = baseline_top_k_pct(df_test, probs_test, k_pct)
         label = f"top_{int(k_pct*100)}pct"
-        results.append(evaluate_selection(df_test_p, mask_topk, label, alpha, duration_col))
+        results.append(evaluate_selection(
+            df_test_p, mask_topk, label, alpha, duration_col, order_by="prob"
+        ))
 
-    # 9. Random matched budget (matches global conformal)
+    # 9. Random matched budget (matches global conformal, random execution order)
     mask_rand = baseline_random_matched_budget(df_test, mask_global, rng=rng)
-    results.append(evaluate_selection(df_test_p, mask_rand, "random_matched", alpha, duration_col))
+    results.append(evaluate_selection(
+        df_test_p, mask_rand, "random_matched", alpha, duration_col, order_by="random", rng=rng
+    ))
 
-    # 10. Recently failed
+    # 10. Recently failed (ordered by recency of failure)
     mask_recent = baseline_recently_failed(df_test)
-    results.append(evaluate_selection(df_test_p, mask_recent, "recently_failed", alpha, duration_col))
+    results.append(evaluate_selection(
+        df_test_p, mask_recent, "recently_failed", alpha, duration_col, order_by="recently_failed"
+    ))
 
     # 11. Threshold by target recall (if validation set provided)
     if df_val is not None and probs_val is not None:
         mask_tgt = baseline_threshold_target_recall(
             df_val, probs_val, df_test, probs_test, target_recall=1.0 - alpha
         )
-        results.append(evaluate_selection(df_test_p, mask_tgt, "threshold_target_recall", alpha, duration_col))
+        results.append(evaluate_selection(
+            df_test_p, mask_tgt, "threshold_target_recall", alpha, duration_col, order_by="prob"
+        ))
 
     return results
