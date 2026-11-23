@@ -73,12 +73,26 @@ def compute_global_threshold(scores: np.ndarray, alpha: float) -> float:
     Parameters
     ----------
     scores : conformal scores from defective calibration commits
-    alpha  : allowed miss rate
+    alpha  : allowed miss rate (must satisfy 0 < alpha < 1)
 
     Returns
     -------
     lambda_ : float threshold
+
+    Raises
+    ------
+    ValueError
+        If alpha is not in (0, 1), scores is empty, or scores contain
+        non-finite values.
     """
+    if not (0 < alpha < 1):
+        raise ValueError(f"alpha must be in (0, 1), got {alpha!r}")
+    scores = np.asarray(scores, dtype=float)
+    if scores.size == 0:
+        raise ValueError("scores is empty; cannot compute conformal threshold")
+    if not np.all(np.isfinite(scores)):
+        raise ValueError("scores contains NaN or Inf values")
+
     scores_sorted = np.sort(scores)
     n = len(scores_sorted)
     k = int(np.floor(alpha * (n + 1)))
@@ -140,7 +154,26 @@ def compute_tau_residual(
 
     If k < 1  → τ = 0.0  (run all tests for every commit).
     If k > n  → τ = R_{(n)}  (most permissive).
+
+    Parameters
+    ----------
+    df    : calibration DataFrame with 'commit_idx', 'label', 'testName'
+    probs : predicted probabilities aligned with df rows
+    alpha : allowed miss rate (must satisfy 0 < alpha < 1)
+
+    Raises
+    ------
+    ValueError
+        If alpha is not in (0, 1), probs is empty, or probs contain
+        non-finite values.
     """
+    if not (0 < alpha < 1):
+        raise ValueError(f"alpha must be in (0, 1), got {alpha!r}")
+    probs = np.asarray(probs, dtype=float)
+    if probs.size == 0:
+        raise ValueError("probs is empty; cannot calibrate tau")
+    if not np.all(np.isfinite(probs)):
+        raise ValueError("probs contains NaN or Inf values")
     df = df.copy()
     df["_prob"] = probs
 

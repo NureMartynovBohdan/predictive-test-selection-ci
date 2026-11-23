@@ -106,30 +106,42 @@ def chrono_split(
 def rolling_time_splits(
     df: pd.DataFrame,
     n_splits: int = 3,
-    min_train_frac: float = 0.30,
+    min_train_frac: float = 0.25,
     prob_calib_frac: float = 0.15,
     conf_calib_frac: float = 0.15,
-    test_frac: float = 0.20,
+    test_frac: float = 0.15,
 ) -> List[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
-    """Generate multiple chronological splits using expanding windows.
-
-    Each split uses a progressively larger training set while keeping
-    ``prob_calib``, ``conf_calib`` and ``test`` fractions constant.
+    """Generate multiple chronological splits using expanding windows
+    with bounded, non-overlapping test windows.
     """
     commit_indices = sorted(df["commit_idx"].unique())
     n = len(commit_indices)
     needed = prob_calib_frac + conf_calib_frac + test_frac
-    if min_train_frac + needed > 1.0:
+    if min_train_frac + needed > 1.0 + 1e-9:
         raise ValueError("Fractions exceed 1.0")
 
     splits = []
-    available_train = 1.0 - needed  # max fraction for training
-    step = (available_train - min_train_frac) / max(n_splits - 1, 1) if n_splits > 1 else 0
+    available_train = 1.0 - needed
+    step = (available_train - min_train_frac) / max(n_splits - 1, 1) if n_splits > 1 else 0.0
 
     for i in range(n_splits):
         t_frac = min_train_frac + step * i
-        result = chrono_split_4(df, t_frac, prob_calib_frac, conf_calib_frac)
-        splits.append(result)
+        i_train = int(n * t_frac)
+        i_prob = int(n * (t_frac + prob_calib_frac))
+        i_conf = int(n * (t_frac + prob_calib_frac + conf_calib_frac))
+        i_test = n if i == n_splits - 1 else int(n * (t_frac + needed))
+
+        train_c = set(commit_indices[:i_train])
+        prob_c = set(commit_indices[i_train:i_prob])
+        conf_c = set(commit_indices[i_prob:i_conf])
+        test_c = set(commit_indices[i_conf:i_test])
+
+        splits.append((
+            df[df["commit_idx"].isin(train_c)].copy(),
+            df[df["commit_idx"].isin(prob_c)].copy(),
+            df[df["commit_idx"].isin(conf_c)].copy(),
+            df[df["commit_idx"].isin(test_c)].copy(),
+        ))
 
     return splits
 
@@ -216,3 +228,18 @@ def compute_pr_auc(labels: np.ndarray, probs: np.ndarray) -> float:
     if labels.sum() == 0:
         return 0.0
     return float(average_precision_score(labels, probs))
+
+
+def compute_brier_score(labels: np.ndarray, probs: np.ndarray) -> float:
+    """Brier score = mean squared error of probability forecasts.
+
+    BS = (1/n) Σ (p̂_i − y_i)²
+
+    Lower is better (0 = perfect, 0.25 = no-skill uninformative model).
+    Returns NaN if labels array is empty.
+    """
+    labels = np.asarray(labels, dtype=float)
+    probs = np.asarray(probs, dtype=float)
+    if len(labels) == 0:
+        return float("nan")
+    return float(np.mean((probs - labels) ** 2))

@@ -707,6 +707,256 @@ class TestCostAwareAndPolicy:
         assert 0.0 <= res_random_1["apfdc"] <= 1.0
 
 
+# ===================================================================
+# New tests for methodological audit items
+# ===================================================================
+
+class TestParentSource:
+    """Task 1: parent_source field and parent_mixed label_status."""
+
+    def test_parent_source_git_vs_chronological(self, tmp_path: Path):
+        """parent_source should be 'git_parent' when git bare repo supplies C^1,
+        and 'chronological_fallback' when no git repo present."""
+        from simulator import CIHistorySimulator
+
+        project = "ps_proj"
+        _setup_rtp_project(
+            tmp_path,
+            project,
+            job_sha_rows=[(1, "A"), (2, "B"), (3, "C")],
+            patch_rows=[("A", "F.java"), ("B", "F.java"), ("C", "F.java")],
+            run_rows=[
+                (1, "t1", 1.0, 0, 0),
+                (2, "t1", 1.0, 1, 0),
+                (3, "t1", 1.0, 1, 0),
+            ],
+        )
+        sim = CIHistorySimulator(tmp_path, project)
+
+        # No git bare repo → all fallback or none
+        src_A = sim.get_parent_source("A")
+        src_B = sim.get_parent_source("B")
+        src_C = sim.get_parent_source("C")
+
+        assert src_A in ("none", "chronological_fallback")
+        assert src_B == "chronological_fallback"
+        assert src_C == "chronological_fallback"
+
+        # parent_source propagated to TestResult
+        gt_B = sim.reveal_ground_truth("B")
+        assert gt_B.test_results["t1"].parent_source == "chronological_fallback"
+
+        gt_A = sim.reveal_ground_truth("A")
+        assert gt_A.test_results["t1"].parent_source == "none"
+
+    def test_parent_mixed_label_status(self, tmp_path: Path):
+        """parent=[pass, pass, fail] -> current=[fail] -> label_status='parent_mixed', not 'already_failing'."""
+        from simulator import CIHistorySimulator
+
+        project = "pm_proj"
+        # Parent A has mixed outcomes (jobs 1=pass, 2=pass, 3=fail)
+        # Child B has single fail (job 4)
+        _setup_rtp_project(
+            tmp_path,
+            project,
+            job_sha_rows=[(1, "A"), (2, "A"), (3, "A"), (4, "B")],
+            patch_rows=[("A", "File.java"), ("B", "File.java")],
+            run_rows=[
+                (1, "test_X", 1.0, 0, 0),   # A: pass
+                (2, "test_X", 1.0, 0, 0),   # A: pass
+                (3, "test_X", 1.0, 1, 0),   # A: fail  → mixed
+                (4, "test_X", 1.0, 1, 0),   # B: fail
+            ],
+        )
+        sim = CIHistorySimulator(tmp_path, project)
+
+        gt = sim.reveal_ground_truth("B", policy="confirmed_new_fail")
+        res = gt.test_results["test_X"]
+
+        # Parent A has mixed outcomes
+        assert res.parent_status == "mixed"
+        # Must NOT be 'already_failing' — parent wasn't purely failing
+        assert res.label_status == "parent_mixed"
+        assert res.label == 0  # confirmed_new_fail requires parent=pass
+
+        # strict_all_fail and any_fail still yield label=1
+        gt_strict = sim.reveal_ground_truth("B", policy="strict_all_fail")
+        assert gt_strict.test_results["test_X"].label == 1
+
+        gt_any = sim.reveal_ground_truth("B", policy="any_fail")
+        assert gt_any.test_results["test_X"].label == 1
+
+
+class TestConformalValidation:
+    """Task 3: Input validation in conformal.py."""
+
+    def test_global_threshold_alpha_zero_raises(self):
+        from conformal import compute_global_threshold
+        with pytest.raises(ValueError, match="alpha"):
+            compute_global_threshold(np.array([0.1, 0.2]), alpha=0.0)
+
+    def test_global_threshold_alpha_one_raises(self):
+        from conformal import compute_global_threshold
+        with pytest.raises(ValueError, match="alpha"):
+            compute_global_threshold(np.array([0.1, 0.2]), alpha=1.0)
+
+    def test_global_threshold_alpha_negative_raises(self):
+        from conformal import compute_global_threshold
+        with pytest.raises(ValueError, match="alpha"):
+            compute_global_threshold(np.array([0.1, 0.2]), alpha=-0.1)
+
+    def test_global_threshold_empty_scores_raises(self):
+        from conformal import compute_global_threshold
+        with pytest.raises(ValueError, match="empty"):
+            compute_global_threshold(np.array([]), alpha=0.10)
+
+    def test_global_threshold_nan_scores_raises(self):
+        from conformal import compute_global_threshold
+        with pytest.raises(ValueError, match="NaN"):
+            compute_global_threshold(np.array([0.1, float("nan")]), alpha=0.10)
+
+    def test_global_threshold_inf_scores_raises(self):
+        from conformal import compute_global_threshold
+        with pytest.raises(ValueError, match="NaN"):
+            compute_global_threshold(np.array([0.1, float("inf")]), alpha=0.10)
+
+    def test_tau_residual_alpha_zero_raises(self):
+        from conformal import compute_tau_residual
+        df = pd.DataFrame({"commit_idx": [0], "testName": ["t"], "label": [1]})
+        with pytest.raises(ValueError, match="alpha"):
+            compute_tau_residual(df, np.array([0.5]), alpha=0.0)
+
+    def test_tau_residual_alpha_one_raises(self):
+        from conformal import compute_tau_residual
+        df = pd.DataFrame({"commit_idx": [0], "testName": ["t"], "label": [1]})
+        with pytest.raises(ValueError, match="alpha"):
+            compute_tau_residual(df, np.array([0.5]), alpha=1.0)
+
+    def test_tau_residual_empty_raises(self):
+        from conformal import compute_tau_residual
+        df = pd.DataFrame({"commit_idx": [0], "testName": ["t"], "label": [1]})
+        with pytest.raises(ValueError, match="empty"):
+            compute_tau_residual(df, np.array([]), alpha=0.10)
+
+    def test_tau_residual_nan_raises(self):
+        from conformal import compute_tau_residual
+        df = pd.DataFrame({"commit_idx": [0], "testName": ["t"], "label": [1]})
+        with pytest.raises(ValueError, match="NaN"):
+            compute_tau_residual(df, np.array([float("nan")]), alpha=0.10)
+
+
+class TestBrierScoreAndWilsonCI:
+    """Task 4: Brier score and Wilson CI for CMR."""
+
+    def test_brier_perfect_prediction(self):
+        from models import compute_brier_score
+        labels = np.array([1, 0, 1, 0])
+        probs  = np.array([1.0, 0.0, 1.0, 0.0])
+        assert compute_brier_score(labels, probs) == pytest.approx(0.0)
+
+    def test_brier_worst_prediction(self):
+        from models import compute_brier_score
+        labels = np.array([1, 0])
+        probs  = np.array([0.0, 1.0])
+        assert compute_brier_score(labels, probs) == pytest.approx(1.0)
+
+    def test_brier_uninformative(self):
+        from models import compute_brier_score
+        labels = np.array([1, 0, 1, 0])
+        probs  = np.array([0.5, 0.5, 0.5, 0.5])
+        assert compute_brier_score(labels, probs) == pytest.approx(0.25)
+
+    def test_brier_empty(self):
+        from models import compute_brier_score
+        assert np.isnan(compute_brier_score(np.array([]), np.array([])))
+
+    def test_wilson_ci_zero_misses_11_defective(self):
+        """0 misses out of 11 defective commits: upper 95% bound ≈ 0.258 (Wilson)."""
+        from evaluate import compute_cmr_wilson_ci
+        # 11 defective commits, 0 misses
+        n = 11
+        df = pd.DataFrame({
+            "commit_idx": list(range(n)),
+            "label": [1] * n,
+        })
+        # select all → 0 misses
+        selected = np.ones(n, dtype=bool)
+        cmr_val, ci_low, ci_high = compute_cmr_wilson_ci(df, selected)
+        assert cmr_val == pytest.approx(0.0)
+        assert ci_low == pytest.approx(0.0)
+        # Upper Wilson bound for p=0, n=11, z=1.96:
+        # centre = z²/(2n) / (1 + z²/n) = (1.96²/22) / (1 + 1.96²/11)
+        assert 0.20 < ci_high < 0.32  # approximately 0.258
+
+    def test_wilson_ci_all_misses(self):
+        """All 5 commits missed → cmr=1.0, ci_low ≈ 0.63, ci_high = 1.0."""
+        from evaluate import compute_cmr_wilson_ci
+        n = 5
+        df = pd.DataFrame({
+            "commit_idx": list(range(n)),
+            "label": [1] * n,
+        })
+        selected = np.zeros(n, dtype=bool)
+        cmr_val, ci_low, ci_high = compute_cmr_wilson_ci(df, selected)
+        assert cmr_val == pytest.approx(1.0)
+        assert ci_low > 0.5
+        assert ci_high == pytest.approx(1.0)
+
+    def test_evaluate_selection_includes_ci(self):
+        """evaluate_selection result dict must include cmr_ci_low and cmr_ci_high."""
+        from evaluate import evaluate_selection
+        df = pd.DataFrame({
+            "commit_idx": [0, 1],
+            "testName":   ["t1", "t2"],
+            "label":      [1, 1],
+            "actual_duration": [10.0, 10.0],
+            "_prob": [0.9, 0.9],
+        })
+        selected = np.array([True, True])
+        res = evaluate_selection(df, selected, "test_method", alpha=0.10)
+        assert "cmr_ci_low" in res
+        assert "cmr_ci_high" in res
+        assert 0.0 <= res["cmr_ci_low"] <= res["cmr_ci_high"] <= 1.0
+
+
+class TestFeatureColsAudit:
+    """Task 2: lines_added and lines_deleted must NOT be in FEATURE_COLS."""
+
+    def test_lines_added_not_in_feature_cols(self):
+        from features import FEATURE_COLS
+        assert "lines_added" not in FEATURE_COLS, (
+            "lines_added must be excluded from FEATURE_COLS "
+            "(RTPTorrent has no diff line counts)"
+        )
+
+    def test_lines_deleted_not_in_feature_cols(self):
+        from features import FEATURE_COLS
+        assert "lines_deleted" not in FEATURE_COLS, (
+            "lines_deleted must be excluded from FEATURE_COLS "
+            "(RTPTorrent has no diff line counts)"
+        )
+
+    def test_public_api_no_private_access_needed(self, tmp_path: Path):
+        """get_commit_min_job and get_changed_files work and match private fields."""
+        from simulator import CIHistorySimulator
+
+        project = "pub_api_proj"
+        _setup_rtp_project(
+            tmp_path,
+            project,
+            job_sha_rows=[(5, "X"), (10, "Y")],
+            patch_rows=[("X", "foo.java"), ("X", "bar.java"), ("Y", "baz.java")],
+            run_rows=[(5, "t1", 1.0, 0, 0), (10, "t1", 1.0, 1, 0)],
+        )
+        sim = CIHistorySimulator(tmp_path, project)
+
+        # Public API matches private
+        assert sim.get_commit_min_job("X") == sim._commit_min_job["X"]
+        assert sim.get_commit_min_job("Y") == sim._commit_min_job["Y"]
+        assert set(sim.get_changed_files("X")) == set(sim._patches.get("X", []))
+        assert sim.get_changed_files("Y") == sim._patches.get("Y", [])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

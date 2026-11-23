@@ -54,6 +54,60 @@ def compute_cmr(
     return misses / len(unique_defective)
 
 
+def compute_cmr_wilson_ci(
+    df: pd.DataFrame,
+    selected_mask: np.ndarray,
+    confidence: float = 0.95,
+) -> tuple:
+    """Wilson score 95% CI for CMR (miss rate proportion).
+
+    Returns (cmr, ci_low, ci_high) tuple.
+
+    Uses the Wilson score interval which is valid even for extreme
+    proportions (cmr ≈ 0 or 1) and small sample sizes.
+
+    Parameters
+    ----------
+    df : DataFrame with 'commit_idx' and 'label' columns
+    selected_mask : boolean mask of selected tests
+    confidence : confidence level (default 0.95)
+
+    Returns
+    -------
+    (cmr, ci_low, ci_high) : all in [0, 1]
+    """
+    df = df.copy()
+    df["_sel"] = selected_mask
+
+    defective_commits = df.groupby("commit_idx")["label"].transform("max")
+    defective_df = df[defective_commits == 1]
+    unique_defective = defective_df["commit_idx"].unique()
+    n = len(unique_defective)
+
+    if n == 0:
+        return (0.0, 0.0, 0.0)
+
+    misses = 0
+    for cid in unique_defective:
+        grp = defective_df[defective_df["commit_idx"] == cid]
+        if not (grp["_sel"] & (grp["label"] == 1)).any():
+            misses += 1
+
+    p_hat = misses / n
+
+    # Wilson score interval
+    from scipy.stats import norm as _norm
+    z = _norm.ppf((1 + confidence) / 2)
+    z2 = z * z
+    denom = 1 + z2 / n
+    centre = (p_hat + z2 / (2 * n)) / denom
+    spread = z * np.sqrt(p_hat * (1 - p_hat) / n + z2 / (4 * n * n)) / denom
+    ci_low = float(np.clip(centre - spread, 0.0, 1.0))
+    ci_high = float(np.clip(centre + spread, 0.0, 1.0))
+
+    return (float(p_hat), ci_low, ci_high)
+
+
 def compute_budget_saved(
     df: pd.DataFrame,
     selected_mask: np.ndarray,
@@ -402,6 +456,7 @@ def evaluate_selection(
         df_selected["_rank"] = 1
 
     cmr = compute_cmr(df_work, selected_mask)
+    cmr_val, cmr_ci_low, cmr_ci_high = compute_cmr_wilson_ci(df_work, selected_mask)
     budget = compute_budget_saved(df_work, selected_mask, duration_col)
     ttff = compute_ttff(df_selected, duration_col) if len(df_selected) > 0 else float("nan")
     apfdc = compute_apfdc(df_selected, duration_col) if len(df_selected) > 0 else float("nan")
@@ -410,6 +465,8 @@ def evaluate_selection(
         "method": method_name,
         "alpha": alpha,
         "cmr": cmr,
+        "cmr_ci_low": cmr_ci_low,
+        "cmr_ci_high": cmr_ci_high,
         "pct_tests_selected": budget["pct_tests_selected"],
         "pct_duration_selected": budget["pct_duration_selected"],
         "pct_duration_saved": budget["pct_duration_saved"],

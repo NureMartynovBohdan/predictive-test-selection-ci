@@ -140,7 +140,7 @@ def build_features(
     ctx = simulator.get_decision_context(commit_sha)
     as_of = simulator.get_commit_order(commit_sha)
     # Use min job_id of this commit as the temporal cut-off for history
-    as_of_job = simulator._commit_min_job.get(commit_sha, as_of)
+    as_of_job = simulator.get_commit_min_job(commit_sha)
 
     changed_files = ctx.changed_files
     n_changed = ctx.n_changed_files
@@ -180,7 +180,9 @@ def build_features(
         fail_rate_20 = _fail_rate(history[-20:]) if history else 0.0
         fail_rate_50 = _fail_rate(history[-50:]) if history else 0.0
 
-        # New failure rate (transitions in past 50)
+        # New failure rate (sequential pass->fail transitions in past 50 runs).
+        # NOTE: this counts consecutive pass->fail transitions in the run *history*,
+        # NOT strict regressions relative to the Git parent commit.
         window_50 = history[-50:]
         new_fail_count = 0
         for i in range(1, len(window_50)):
@@ -265,7 +267,7 @@ def build_features(
             for r in history[-50:]:
                 seen_commits.setdefault(r.commit_sha, []).append(r)
             for past_sha, past_runs in seen_commits.items():
-                past_files = simulator._patches.get(past_sha, [])
+                past_files = simulator.get_changed_files(past_sha)
                 if set(past_files) & curr_set:
                     co_seen += 1
                     if any(r.failed for r in past_runs):
@@ -295,8 +297,7 @@ def build_features(
             "parent_result_known": parent_result_known,
             # Group 3 — commit characteristics
             "n_changed_files": n_changed,
-            "lines_added": 0,       # Not available in RTPTorrent
-            "lines_deleted": 0,     # Not available in RTPTorrent
+            # Note: lines_added / lines_deleted not available in RTPTorrent (only file names)
             "n_prod_files_changed": n_prod_files,
             "n_test_files_changed": n_test_files,
             "has_java": has_java,
@@ -338,13 +339,17 @@ def build_features_batch(
 FEATURE_COLS = [
     # Group 1 — test history
     "fail_rate_5", "fail_rate_20", "fail_rate_50",
+    # new_failure_rate_50: frequency of sequential pass->fail transitions in run history
+    # (NOT strict regressions relative to Git parent commit)
     "new_failure_rate_50", "new_failure_support",
     "last_fail_dist", "last_observed_status", "run_count_total",
     "duration_median_20", "duration_p90_20", "duration_history_known",
     # Group 2 — parent status
     "parent_status_code", "parent_result_known",
     # Group 3 — commit characteristics
-    "n_changed_files", "lines_added", "lines_deleted",
+    # Note: lines_added and lines_deleted are intentionally excluded —
+    # RTPTorrent only provides changed file names, not diff line counts.
+    "n_changed_files",
     "n_prod_files_changed", "n_test_files_changed",
     "has_java", "has_xml", "has_build_file",
     # Group 4 — coupling

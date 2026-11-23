@@ -16,8 +16,13 @@ Key Architecture:
 6. `reveal_ground_truth` is called only AFTER the selector has made
    its decision (or for completed past steps during training).
 7. Diagnostic fields: commit_sha, parent_sha, parent_status, current_status,
-   label_status (confirmed_new_fail, no_new_fail, already_failing, unknown_parent).
+   label_status (confirmed_new_fail, no_new_fail, already_failing, unknown_parent,
+   parent_mixed), parent_source (git_parent | chronological_fallback | none).
 8. Sensitivity analysis support: label_policy in ('confirmed_new_fail', 'strict_all_fail', 'any_fail').
+9. parent_status can now be 'pass' | 'fail' | 'mixed' | 'unknown'.
+   parent=mixed -> current=fail produces label_status='parent_mixed' (label=0 in
+   confirmed_new_fail), not 'already_failing', so audits can distinguish old breaks
+   from ambiguous mixed-parent situations.
 """
 
 from __future__ import annotations
@@ -83,15 +88,17 @@ class TestResult:
     label: int                    # 1 = target failure by policy
     actual_duration: float
     current_status: str           # 'pass' | 'fail' | 'mixed'
-    parent_status: str            # 'pass' | 'fail' | 'unknown'
+    parent_status: str            # 'pass' | 'fail' | 'mixed' | 'unknown'
     label_status: str             # 'confirmed_new_fail' | 'no_new_fail'
                                   # | 'already_failing' | 'unknown_parent'
+                                  # | 'parent_mixed'
     n_pass: int
     n_fail: int
     n_attempts: int
     mixed_outcomes_same_sha: bool
     parent_sha: Optional[str] = None
     commit_sha: Optional[str] = None
+    parent_source: str = "none"   # 'git_parent' | 'chronological_fallback' | 'none'
 
     @property
     def label_attribution(self) -> str:
@@ -178,11 +185,17 @@ class CIHistorySimulator:
         # Prioritize true Git parent (first parent C^1 for merge commits);
         # fallback to chronological predecessor if absent from git repo.
         self._parent_sha: Dict[str, Optional[str]] = {}
+        self._parent_source: Dict[str, str] = {}  # 'git_parent' | 'chronological_fallback' | 'none'
         for idx, sha in enumerate(self._commit_list):
             if sha in self._git_parents:
                 self._parent_sha[sha] = self._git_parents[sha]
+                self._parent_source[sha] = "git_parent"
+            elif idx > 0:
+                self._parent_sha[sha] = self._commit_list[idx - 1]
+                self._parent_source[sha] = "chronological_fallback"
             else:
-                self._parent_sha[sha] = self._commit_list[idx - 1] if idx > 0 else None
+                self._parent_sha[sha] = None
+                self._parent_source[sha] = "none"
 
         # Update parent_sha in test runs
         for r in self._runs:
@@ -399,6 +412,7 @@ class CIHistorySimulator:
 
         runs = self._runs_by_commit.get(commit_sha, [])
         parent_sha = self._parent_sha.get(commit_sha)
+        as_of_order = self._commit_min_job[commit_sha]
 
         by_test: Dict[str, List[TestRun]] = {}
         for r in runs:
@@ -421,25 +435,33 @@ class CIHistorySimulator:
 
             mixed = current_status == "mixed"
 
-            # Parent status
+            # Parent status (now detects mixed parent outcomes)
             if parent_sha is None:
                 p_status_str = "unknown"
             else:
                 parent_runs_all = [
                     r for r in self._runs_by_commit.get(parent_sha, [])
-                    if r.test_name == test_name
+                    if r.test_name == test_name and r.job_order < as_of_order
                 ]
                 if not parent_runs_all:
                     p_status_str = "unknown"
                 else:
-                    all_passed = all(r.passed for r in parent_runs_all)
-                    p_status_str = "pass" if all_passed else "fail"
+                    p_pass = sum(1 for r in parent_runs_all if r.passed)
+                    p_fail = sum(1 for r in parent_runs_all if r.failed)
+                    if p_fail == 0:
+                        p_status_str = "pass"
+                    elif p_pass == 0:
+                        p_status_str = "fail"
+                    else:
+                        p_status_str = "mixed"
 
             # Label status attribution
             if current_status == "fail" and p_status_str == "pass":
                 label_status = "confirmed_new_fail"
             elif current_status == "fail" and p_status_str == "fail":
                 label_status = "already_failing"
+            elif current_status == "fail" and p_status_str == "mixed":
+                label_status = "parent_mixed"
             elif current_status == "fail" and p_status_str == "unknown":
                 label_status = "unknown_parent"
             else:
@@ -455,6 +477,8 @@ class CIHistorySimulator:
             else:
                 raise ValueError(f"Unknown policy: {active_policy}")
 
+            p_source = self._parent_source.get(commit_sha, "none")
+
             results[test_name] = TestResult(
                 label=label,
                 actual_duration=mean_dur,
@@ -467,6 +491,7 @@ class CIHistorySimulator:
                 mixed_outcomes_same_sha=mixed,
                 parent_sha=parent_sha,
                 commit_sha=commit_sha,
+                parent_source=p_source,
             )
 
         return GroundTruth(commit_sha=commit_sha, test_results=results)
@@ -475,6 +500,27 @@ class CIHistorySimulator:
 
     def get_commit_order(self, commit_sha: str) -> int:
         return self._commit_order[commit_sha]
+
+    def get_commit_min_job(self, commit_sha: str) -> int:
+        """Return the minimum job_id for commit_sha (used as temporal cut-off).
+
+        Public alternative to accessing ``_commit_min_job`` directly.
+        """
+        return self._commit_min_job[commit_sha]
+
+    def get_changed_files(self, commit_sha: str) -> List[str]:
+        """Return list of changed files for commit_sha.
+
+        Public alternative to accessing ``_patches`` directly.
+        """
+        return self._patches.get(commit_sha, [])
+
+    def get_parent_source(self, commit_sha: str) -> str:
+        """Return the source of the parent SHA for commit_sha.
+
+        Returns 'git_parent', 'chronological_fallback', or 'none'.
+        """
+        return self._parent_source.get(commit_sha, "none")
 
     def get_all_commits(self) -> List[str]:
         return list(self._commit_list)
