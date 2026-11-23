@@ -1,26 +1,46 @@
 """
-evaluate.py — Metrics & Baseline Comparisons (v2)
-==================================================
+evaluate.py — Metrics & Baseline Comparisons (v2.1)
+===================================================
 Implements:
-  - CMR  (Change Miss Rate)
+  - CMR  (Change Miss Rate) with Wilson score 95% CI and moving block bootstrap CI
   - Budget saved (% tests, % duration)
-  - TTFF (cumulative actual duration to first failure)
-  - APFDc (standard cost-cognizant formula, no clip)
+  - TTFF (simulated sequential cumulative actual duration to first failure)
+  - Conditional APFDc (standard cost-cognizant formula computed over selected
+    tests on detected defective commits, no clip)
   - Baselines: retest-all, top-k%, fixed threshold, random matched budget,
                recently failed, naive residual risk, threshold by target recall
   - Cost-aware prioritization comparison (probability order vs p/duration order)
   - compare_all_methods() aggregator
 
-NOTE: TTFF and APFDc are *conditional* metrics — computed only on
-detected defective commits.  They **must** always be reported
-alongside CMR (the fraction of defective commits missed entirely).
+NOTE:
+  1. TTFF measures *simulated sequential execution time* (sum of individual test
+     durations in execution order) without modeling parallel CI workers.
+  2. TTFF and APFDc are *conditional* metrics — computed only on detected
+     defective commits, and APFDc uses the total duration of the *selected*
+     test subset as denominator T. They **must** always be reported alongside
+     CMR and test budget.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def _drop_missing_labels(
+    df: pd.DataFrame,
+    selected_mask: Optional[np.ndarray] = None,
+) -> Tuple[pd.DataFrame, Optional[np.ndarray]]:
+    """Safely filter out rows with None/NaN labels before binary metric evaluation."""
+    if "label" not in df.columns:
+        return df, selected_mask
+    valid = df["label"].notna().values
+    if valid.all():
+        return df, selected_mask
+    df_valid = df.loc[valid].copy()
+    mask_valid = selected_mask[valid] if selected_mask is not None else None
+    return df_valid, mask_valid
 
 
 # ---------------------------------------------------------------------------
@@ -33,12 +53,18 @@ def compute_cmr(
 ) -> float:
     """Change Miss Rate = fraction of defective commits where NO selected
     test has ``label == 1``.
-    """
-    df = df.copy()
-    df["_sel"] = selected_mask
 
-    defective_commits = df.groupby("commit_idx")["label"].transform("max")
-    defective_df = df[defective_commits == 1]
+    Rows with ``label`` equal to ``None``/``NaN`` are excluded.
+    """
+    df_valid, mask_valid = _drop_missing_labels(df, selected_mask)
+    if len(df_valid) == 0:
+        return 0.0
+
+    df_work = df_valid.copy()
+    df_work["_sel"] = mask_valid
+
+    defective_commits = df_work.groupby("commit_idx")["label"].transform("max")
+    defective_df = df_work[defective_commits == 1]
 
     unique_defective = defective_df["commit_idx"].unique()
     if len(unique_defective) == 0:
@@ -54,58 +80,97 @@ def compute_cmr(
     return misses / len(unique_defective)
 
 
+def _commit_miss_indicators(
+    df: pd.DataFrame,
+    selected_mask: np.ndarray,
+) -> np.ndarray:
+    """Return chronological binary array of miss indicators (1=missed, 0=detected)
+    over defective commits.
+    """
+    df_valid, mask_valid = _drop_missing_labels(df, selected_mask)
+    if len(df_valid) == 0:
+        return np.array([], dtype=int)
+
+    df_work = df_valid.copy()
+    df_work["_sel"] = mask_valid
+
+    defective_commits = df_work.groupby("commit_idx")["label"].transform("max")
+    defective_df = df_work[defective_commits == 1]
+    unique_defective = np.sort(defective_df["commit_idx"].unique())
+
+    indicators = np.zeros(len(unique_defective), dtype=int)
+    for i, cid in enumerate(unique_defective):
+        grp = defective_df[defective_df["commit_idx"] == cid]
+        if not (grp["_sel"] & (grp["label"] == 1)).any():
+            indicators[i] = 1
+    return indicators
+
+
 def compute_cmr_wilson_ci(
     df: pd.DataFrame,
     selected_mask: np.ndarray,
     confidence: float = 0.95,
-) -> tuple:
-    """Wilson score 95% CI for CMR (miss rate proportion).
+) -> Tuple[float, float, float]:
+    """Wilson score confidence interval for CMR (descriptive, assumes i.i.d. commits).
 
-    Returns (cmr, ci_low, ci_high) tuple.
-
-    Uses the Wilson score interval which is valid even for extreme
-    proportions (cmr ≈ 0 or 1) and small sample sizes.
-
-    Parameters
-    ----------
-    df : DataFrame with 'commit_idx' and 'label' columns
-    selected_mask : boolean mask of selected tests
-    confidence : confidence level (default 0.95)
-
-    Returns
-    -------
-    (cmr, ci_low, ci_high) : all in [0, 1]
+    Returns ``(cmr, ci_low, ci_high)`` tuple, all in ``[0, 1]``.
     """
-    df = df.copy()
-    df["_sel"] = selected_mask
-
-    defective_commits = df.groupby("commit_idx")["label"].transform("max")
-    defective_df = df[defective_commits == 1]
-    unique_defective = defective_df["commit_idx"].unique()
-    n = len(unique_defective)
-
+    indicators = _commit_miss_indicators(df, selected_mask)
+    n = len(indicators)
     if n == 0:
         return (0.0, 0.0, 0.0)
 
-    misses = 0
-    for cid in unique_defective:
-        grp = defective_df[defective_df["commit_idx"] == cid]
-        if not (grp["_sel"] & (grp["label"] == 1)).any():
-            misses += 1
+    p_hat = float(indicators.mean())
 
-    p_hat = misses / n
-
-    # Wilson score interval
     from scipy.stats import norm as _norm
-    z = _norm.ppf((1 + confidence) / 2)
+    z = float(_norm.ppf((1.0 + confidence) / 2.0))
     z2 = z * z
-    denom = 1 + z2 / n
-    centre = (p_hat + z2 / (2 * n)) / denom
-    spread = z * np.sqrt(p_hat * (1 - p_hat) / n + z2 / (4 * n * n)) / denom
+    denom = 1.0 + z2 / n
+    centre = (p_hat + z2 / (2.0 * n)) / denom
+    spread = z * np.sqrt(p_hat * (1.0 - p_hat) / n + z2 / (4.0 * n * n)) / denom
     ci_low = float(np.clip(centre - spread, 0.0, 1.0))
     ci_high = float(np.clip(centre + spread, 0.0, 1.0))
 
-    return (float(p_hat), ci_low, ci_high)
+    return (p_hat, ci_low, ci_high)
+
+
+def compute_cmr_block_bootstrap_ci(
+    df: pd.DataFrame,
+    selected_mask: np.ndarray,
+    block_size: int = 5,
+    n_bootstrap: int = 1000,
+    confidence: float = 0.95,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[float, float, float]:
+    """Moving block bootstrap confidence interval for CMR over chronological
+    defective commits, accounting for temporal dependence across adjacent commits.
+
+    Returns ``(cmr, ci_low, ci_high)`` tuple, all in ``[0, 1]``.
+    """
+    indicators = _commit_miss_indicators(df, selected_mask)
+    n = len(indicators)
+    if n == 0:
+        return (0.0, 0.0, 0.0)
+
+    p_hat = float(indicators.mean())
+    if n == 1:
+        return (p_hat, p_hat, p_hat)
+
+    gen = rng if rng is not None else np.random.default_rng(42)
+    b = max(1, min(block_size, n))
+    n_blocks = int(np.ceil(n / b))
+    max_start = n - b + 1
+
+    boot_means = np.empty(n_bootstrap, dtype=float)
+    for k in range(n_bootstrap):
+        starts = gen.integers(0, max_start, size=n_blocks)
+        sampled = np.concatenate([indicators[s:s + b] for s in starts])[:n]
+        boot_means[k] = sampled.mean()
+
+    alpha_tail = (1.0 - confidence) / 2.0
+    ci_low = float(np.clip(np.quantile(boot_means, alpha_tail), 0.0, 1.0))
+    ci_high = float(np.clip(np.quantile(boot_means, 1.0 - alpha_tail), 0.0, 1.0))
+    return (p_hat, ci_low, ci_high)
 
 
 def compute_budget_saved(
@@ -139,26 +204,31 @@ def compute_ttff(
     df: pd.DataFrame,
     duration_col: str = "actual_duration",
 ) -> float:
-    """Time-To-First-Failure — cumulative actual duration to first failure.
+    """Time-To-First-Failure (simulated sequential execution time in seconds).
 
-    For each defective commit where ≥ 1 failure is selected:
-      * Tests are executed in ``_rank`` order.
-      * ``TTFF_c = Σ actual_duration`` for ranks 1 … r where *r* is the
+    For each defective commit where >= 1 failure is selected:
+      * Tests are executed sequentially in ``_rank`` order (no parallel workers).
+      * ``TTFF_c = sum(actual_duration)`` for ranks 1 .. r where *r* is the
         rank of the **first** test with ``label == 1``.
 
-    Returns mean TTFF (seconds) over all such commits, or ``NaN`` if
-    no failures were detected.
+    Returns mean TTFF (seconds) over all detected defective commits, or ``NaN``
+    if no failures were detected.
 
     **Conditional metric** — always report alongside CMR.
     """
+    df_valid, _ = _drop_missing_labels(df)
     scores: list[float] = []
-    for cid, grp in df.groupby("commit_idx"):
+    for cid, grp in df_valid.groupby("commit_idx"):
         failures = grp[grp["label"] == 1]
         if len(failures) == 0:
             continue
         first_fail_rank = failures["_rank"].min()
         tests_up_to = grp[grp["_rank"] <= first_fail_rank]
-        ttff_c = tests_up_to[duration_col].sum() if duration_col in tests_up_to.columns else float(first_fail_rank)
+        ttff_c = (
+            tests_up_to[duration_col].fillna(0.0).sum()
+            if duration_col in tests_up_to.columns
+            else float(first_fail_rank)
+        )
         scores.append(float(ttff_c))
 
     return float(np.mean(scores)) if scores else float("nan")
@@ -168,32 +238,36 @@ def compute_apfdc(
     df: pd.DataFrame,
     duration_col: str = "actual_duration",
 ) -> float:
-    """APFDc — standard cost-cognizant formula.
+    """Conditional APFDc — cost-cognizant fault detection rate within the
+    *selected* test subset on detected defective commits.
 
-    ``APFDc = 1 − Σ_{i=1}^{m} (C_i − t_i/2) / (m · T)``
+    ``Conditional APFDc = 1 - sum_{i=1}^{m} (C_i - t_i / 2) / (m * T)``
 
     where:
       * ``C_i`` = cumulative actual duration up to and including the test
         that detected fault *i*
       * ``t_i`` = actual duration of that test
-      * ``m``   = number of distinct faults detected (failing tests found)
-      * ``T``   = total actual duration of all selected tests for this commit
+      * ``m``   = number of distinct faults detected among selected tests
+      * ``T``   = total actual duration of all *selected* tests for this commit
 
-    Returns mean APFDc over all defective commits where ≥ 1 failure was
-    selected.  Does **not** clip to [0, 1].
-
-    Returns ``NaN`` if no failures detected.
-
-    **Conditional metric** — always report alongside CMR.
+    Because ``T`` is computed over the selected subset (not the full suite),
+    this metric measures prioritization quality *conditional* on selection and
+    detection. It **must** always be interpreted jointly with CMR and budget.
+    Does **not** clip to [0, 1]. Returns ``NaN`` if no failures detected.
     """
+    df_valid, _ = _drop_missing_labels(df)
     scores: list[float] = []
-    for cid, grp in df.groupby("commit_idx"):
+    for cid, grp in df_valid.groupby("commit_idx"):
         failures = grp[grp["label"] == 1]
         if len(failures) == 0:
             continue
 
         grp_sorted = grp.sort_values("_rank")
-        durations = grp_sorted[duration_col].values if duration_col in grp_sorted.columns else np.ones(len(grp_sorted))
+        durations = (
+            grp_sorted[duration_col].fillna(0.0).values
+            if duration_col in grp_sorted.columns
+            else np.ones(len(grp_sorted))
+        )
         labels = grp_sorted["label"].values
 
         T = durations.sum()
@@ -218,6 +292,16 @@ def compute_apfdc(
     return float(np.mean(scores)) if scores else float("nan")
 
 
+def compute_conditional_apfdc(
+    df: pd.DataFrame,
+    duration_col: str = "actual_duration",
+) -> float:
+    """Explicit alias for ``compute_apfdc`` emphasizing conditional evaluation
+    over the selected test subset on detected defective commits.
+    """
+    return compute_apfdc(df, duration_col=duration_col)
+
+
 # ---------------------------------------------------------------------------
 # Baseline Selectors
 # ---------------------------------------------------------------------------
@@ -232,7 +316,7 @@ def baseline_fixed_threshold(
     probs: np.ndarray,
     threshold: float = 0.5,
 ) -> np.ndarray:
-    """Select tests with p̂ ≥ threshold (no conformal calibration)."""
+    """Select tests with p_hat >= threshold (no conformal calibration)."""
     return probs >= threshold
 
 
@@ -309,7 +393,6 @@ def baseline_recently_failed(
     mask = np.zeros(len(df), dtype=bool)
     if "fail_rate_20" in df.columns:
         mask = (df["fail_rate_20"] > 0).values
-        # If fail_rate_20 selects nothing across the dataset, fallback to fail_rate_50
         if not mask.any() and "fail_rate_50" in df.columns:
             mask = (df["fail_rate_50"] > 0).values
     elif "fail_rate_50" in df.columns:
@@ -324,7 +407,7 @@ def baseline_naive_residual(
     probs: np.ndarray,
     alpha: float,
 ) -> np.ndarray:
-    """Naive residual risk: τ = α directly (no conformal calibration)."""
+    """Naive residual risk: tau = alpha directly (no conformal calibration)."""
     from conformal import select_tests_residual_all_commits
     sel = select_tests_residual_all_commits(df, probs, tau=alpha)
     return df.index.isin(sel.index)
@@ -390,7 +473,6 @@ def evaluate_selection(
         df_selected["_sort_name"] = sort_key
 
         if order_by == "cost_aware":
-            # Priority = p / duration_est
             col = est_duration_col if est_duration_col in df_selected.columns else "duration_mean"
             if col in df_selected.columns:
                 dur_est = df_selected[col].fillna(1.0).clip(lower=1e-3)
@@ -399,24 +481,21 @@ def evaluate_selection(
             df_selected["_ordering_key"] = df_selected["_prob"] / dur_est
             df_selected = df_selected.sort_values(
                 ["commit_idx", "_ordering_key", "_sort_name"],
-                ascending=[True, False, True]
+                ascending=[True, False, True],
             )
         elif order_by == "default":
-            # Standard class/test name alphabetical order, independent of ML _prob
             df_selected = df_selected.sort_values(
                 ["commit_idx", "_sort_name"],
-                ascending=[True, True]
+                ascending=[True, True],
             )
         elif order_by == "random":
-            # Random execution order per commit
             gen = rng if rng is not None else np.random.default_rng(42)
             df_selected["_rand_key"] = gen.random(len(df_selected))
             df_selected = df_selected.sort_values(
                 ["commit_idx", "_rand_key"],
-                ascending=[True, True]
+                ascending=[True, True],
             )
         elif order_by == "recently_failed":
-            # Most recent failure first (last_fail_dist ascending, <=0 placed at the end)
             if "last_fail_dist" in df_selected.columns:
                 dist = df_selected["last_fail_dist"].copy()
                 dist = dist.apply(lambda x: 1e9 if pd.isna(x) or x <= 0 else float(x))
@@ -425,30 +504,29 @@ def evaluate_selection(
                     df_selected["_fr_key"] = df_selected["fail_rate_20"].fillna(0.0)
                     df_selected = df_selected.sort_values(
                         ["commit_idx", "_dist_key", "_fr_key", "_sort_name"],
-                        ascending=[True, True, False, True]
+                        ascending=[True, True, False, True],
                     )
                 else:
                     df_selected = df_selected.sort_values(
                         ["commit_idx", "_dist_key", "_sort_name"],
-                        ascending=[True, True, True]
+                        ascending=[True, True, True],
                     )
             elif "fail_rate_20" in df_selected.columns:
                 df_selected["_fr_key"] = df_selected["fail_rate_20"].fillna(0.0)
                 df_selected = df_selected.sort_values(
                     ["commit_idx", "_fr_key", "_sort_name"],
-                    ascending=[True, False, True]
+                    ascending=[True, False, True],
                 )
             else:
                 df_selected = df_selected.sort_values(
                     ["commit_idx", "_sort_name"],
-                    ascending=[True, True]
+                    ascending=[True, True],
                 )
         else:
-            # "prob" or fallback: descending probability
             df_selected["_ordering_key"] = df_selected["_prob"]
             df_selected = df_selected.sort_values(
                 ["commit_idx", "_ordering_key", "_sort_name"],
-                ascending=[True, False, True]
+                ascending=[True, False, True],
             )
 
         df_selected["_rank"] = df_selected.groupby("commit_idx").cumcount() + 1
@@ -456,10 +534,15 @@ def evaluate_selection(
         df_selected["_rank"] = 1
 
     cmr = compute_cmr(df_work, selected_mask)
-    cmr_val, cmr_ci_low, cmr_ci_high = compute_cmr_wilson_ci(df_work, selected_mask)
+    _, cmr_ci_low, cmr_ci_high = compute_cmr_wilson_ci(df_work, selected_mask)
+    _, cmr_boot_low, cmr_boot_high = compute_cmr_block_bootstrap_ci(
+        df_work, selected_mask, block_size=5, n_bootstrap=500, rng=np.random.default_rng(42)
+    )
     budget = compute_budget_saved(df_work, selected_mask, duration_col)
     ttff = compute_ttff(df_selected, duration_col) if len(df_selected) > 0 else float("nan")
-    apfdc = compute_apfdc(df_selected, duration_col) if len(df_selected) > 0 else float("nan")
+    cond_apfdc = compute_conditional_apfdc(df_selected, duration_col) if len(df_selected) > 0 else float("nan")
+
+    df_valid_labels, _ = _drop_missing_labels(df_work)
 
     return {
         "method": method_name,
@@ -467,14 +550,17 @@ def evaluate_selection(
         "cmr": cmr,
         "cmr_ci_low": cmr_ci_low,
         "cmr_ci_high": cmr_ci_high,
+        "cmr_boot_ci_low": cmr_boot_low,
+        "cmr_boot_ci_high": cmr_boot_high,
         "pct_tests_selected": budget["pct_tests_selected"],
         "pct_duration_selected": budget["pct_duration_selected"],
         "pct_duration_saved": budget["pct_duration_saved"],
         "ttff": ttff,
-        "apfdc": apfdc,
+        "apfdc": cond_apfdc,
+        "conditional_apfdc": cond_apfdc,
         "n_defective_commits": int(
-            df[df["label"] == 1].groupby("commit_idx").ngroups
-            if "commit_idx" in df.columns else 0
+            df_valid_labels[df_valid_labels["label"] == 1].groupby("commit_idx").ngroups
+            if "commit_idx" in df_valid_labels.columns and len(df_valid_labels) > 0 else 0
         ),
         "n_total_pairs": len(df),
         "n_selected": int(selected_mask.sum()),
