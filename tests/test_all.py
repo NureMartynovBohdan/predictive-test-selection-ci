@@ -251,8 +251,49 @@ class TestSimulatorLeakagePrevention:
         assert cand_1 == cand_2
         assert "TestAlpha" in cand_1
         assert "TestBeta" in cand_1
+        assert "TestGamma" in cand_1
         assert "TestSneakyFuture" not in cand_1
         assert sim_1.get_decision_context("B").candidate_tests == cand_1
+
+    def test_unobserved_candidate_handled_without_keyerror(self, tmp_path: Path):
+        """
+        If get_candidate_tests(commit) includes a test class (e.g. from patch diff
+        or prior history) that has no run record in reveal_ground_truth(commit),
+        build_project_data must mark it as label=None / label_status='unobserved_candidate'
+        instead of raising KeyError, and filter_valid_pairs must exclude it.
+        """
+        from run_experiment import build_project_data, filter_valid_pairs
+        from simulator import CIHistorySimulator
+
+        project = "unobs_proj"
+        _setup_rtp_project(
+            tmp_path,
+            project,
+            job_sha_rows=[(1, "A"), (2, "B")],
+            patch_rows=[("A", "App.java"), ("B", "GhostTest.java")],
+            run_rows=[
+                (1, "TestAlpha", 1.0, 0, 0),
+                (2, "TestAlpha", 1.0, 0, 0),
+                # GhostTest never ran in commit B CI logs
+            ],
+        )
+        sim = CIHistorySimulator(tmp_path, project)
+
+        assert "GhostTest" in sim.get_candidate_tests("B")
+        gt_b = sim.reveal_ground_truth("B")
+        assert "GhostTest" not in gt_b.test_results
+
+        df_raw = build_project_data(sim, policy="confirmed_new_fail")
+        ghost_rows = df_raw[(df_raw["commit"] == "B") & (df_raw["testName"] == "GhostTest")]
+        assert len(ghost_rows) == 1
+        assert pd.isna(ghost_rows["label"].iloc[0])
+        assert ghost_rows["label_status"].iloc[0] == "unobserved_candidate"
+
+        df_clean, stats = filter_valid_pairs(
+            df_raw, include_fallback_parents=True, policy="confirmed_new_fail", verbose=False
+        )
+        assert "unobserved_candidate" in stats
+        assert not ((df_clean["commit"] == "B") & (df_clean["testName"] == "GhostTest")).any()
 
 
 # ===================================================================

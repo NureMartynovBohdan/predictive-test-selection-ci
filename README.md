@@ -46,9 +46,10 @@
 ```
 
 **Принципи:**
+- `get_candidate_tests(commit_sha)` формує попередній перелік тестів-кандидатів **строго до запуску CI** на `commit_sha`: з історичних запусків у межах `inventory_window` та на `parent_sha` з `job_order < as_of_order`, об'єднаних із тестовими класами (`*Test.java`, `Test*.java`, `*IT.java` тощо) зі змінених файлів патчу. Метод **ніколи не читає** `self._runs_by_commit[commit_sha]`.
 - `DecisionContext` містить **лише** інформацію, відому ДО запуску тестів (хеш, батьківський хеш, змінені файли, список тестів-кандидатів). **Без міток та фактичної тривалості.**
 - `get_test_history(test_name, as_of_order)` повертає тільки запуски з `job_order < as_of_order` — суворе запобігання витоку з майбутнього.
-- `reveal_ground_truth(sha)` викликається **тільки після** прийняття рішення селектором (або для тренувальних даних).
+- `reveal_ground_truth(sha)` викликається **тільки після** прийняття рішення селектором (або для тренувальних даних). Якщо кандидат із дотестового інвентарю не має запису в логах CI для `sha`, він коректно позначається як ненаблюданий (`label = None`, `label_status = "unobserved_candidate"`) без помилки `KeyError`.
 
 ### Запобігання витоку даних (Anti-Leakage)
 
@@ -68,22 +69,28 @@
 - **Коректна обробка дублікатів**: якщо один `job_id` відповідає декільком SHA, зберігається перший запис із попередженням у логах (замість `dict(zip(...))`, яке мовчки перезаписувало дублікати).
 
 ### Батьківський коміт (`parent_source`)
-- Батьківський SHA виводиться **в першу чергу** з Git DAG (справжній `C^1`-батько через `git rev-list --parents --all` з bare-репозиторію).
-- Якщо bare-репозиторій відсутній, застосовується **хронологічний запасний варіант** (попередній коміт за min(job_id)).
+- Батьківський SHA виводиться **в першу чергу** з Git DAG (справжній `C^1`-батько через `git rev-list --parents --all` з bare-репозиторію `rtp-torrent/repo/{project}`).
+- Якщо коміт відсутній у bare-репозиторії (або репозиторій недоступний), застосовується **хронологічний запасний варіант** (`chronological_fallback`: попередній коміт за `min(job_id)`), а кореневі коміти отримують `"none"`.
 - Джерело батька фіксується в полі `parent_source`: `"git_parent"` | `"chronological_fallback"` | `"none"`.
-- Поле `parent_source` передається у `TestResult` та логується під час побудови датасету.
+- **Основний режим експерименту (за замовчуванням):** і основний цикл, і `--rolling` залишають **тільки** рядки з підтвердженим `parent_source == "git_parent"`, жорстко виключаючи `chronological_fallback` та `none` із виведенням кількості виключених рядків. Прапор `--include-fallback-parents` вмикає `chronological_fallback` для окремого аналізу чутливості.
 
-### Розмітка міток (Label Attribution)
-| Статус | Мітка | Пояснення |
+### Розмітка міток (Three-State Label Attribution)
+Під час роботи з основною політикою `confirmed_new_fail` використовується тризначна розмітка (`1`, `0`, `None`), де неоднозначні або непідтверджені спостереження виключаються з бінарного навчання та оцінки (замість зведення до `0`):
+
+| Статус (`label_status`) | Мітка (`label`) | Пояснення |
 |---|---|---|
-| `confirmed_new_fail` | 1 | Тест стабільно падає зараз, на батьку підтверджено `pass` |
-| `no_new_fail` | 0 | Тест проходить або має змішані результати |
-| `already_failing` | 0 | Тест падав і на батьку, і зараз — не нове падіння |
-| `parent_mixed` | 0 | Поточне падіння при неоднозначному статусі батька — відрізняється від `already_failing` в аудиті |
-| `unknown_parent` | 0 (виключ.) | Статус батька невідомий — виключається зі строгого навчання/оцінки |
+| `confirmed_new_fail` | `1` | Тест стабільно падає зараз, на батьку підтверджено `pass` |
+| `no_new_fail` | `0` | Тест стабільно проходить зараз (нових регресій немає) |
+| `already_failing` | `0` | Тест падав і на батьку, і зараз — не нове падіння |
+| `ambiguous_current` | `None` *(викл.)* | Змішані результати (`pass` і `fail`) на поточному SHA |
+| `parent_mixed` | `None` *(викл.)* | Поточний результат за неоднозначного (`mixed`) статусу батька |
+| `unknown_parent` | `None` *(викл.)* | Поточне падіння за невідомого статусу батька |
+| `unobserved_candidate` | `None` *(викл.)* | Кандидат із дотестового інвентарю не зафіксований у логах CI для цього SHA |
 
-### Нестабільні тести (Flaky Tests)
-Поле `mixed_outcomes_same_sha` вказує на змішані результати (pass + fail) тесту на одному SHA в різних конфігураціях матриці збірки. **Це евристичний сигнал неоднозначності**, а не строгий доказ нестабільності (flaky) — оскільки RTPTorrent не містить метаданих середовища виконання (OS/JDK) та причин збоїв інфраструктури/збірки, відрізнити справжню нестабільність від паралельного збою CI неможливо.
+Для аналізу чутливості також підтримуються бінарні політики `--policy strict_all_fail` та `--policy any_fail`.
+
+### Неоднозначні результати на одному SHA (`ambiguous_outcome_same_sha`)
+Поле `ambiguous_outcome_same_sha` (зі зворотним аліасом `mixed_outcomes_same_sha`) фіксує ситуацію, коли один і той самий тест мав одночасно і `pass`, і `fail` у межах одного SHA. Такі випадки отримують `label = None` (`ambiguous_current`) і виключаються зі строгого навчання та оцінки CMR. Оскільки RTPTorrent не містить метаданих середовища виконання чи причин інфраструктурних збоїв, ця ознака трактується як сигнал неоднозначності результату на SHA, а не доказ істинної нестабільності (flaky).
 
 ---
 
@@ -94,7 +101,7 @@
 | Група | Ознаки |
 |---|---|
 | **Історія тесту** | `fail_rate_5/20/50`, `new_failure_rate_50`, `new_failure_support`, `last_fail_dist`, `last_observed_status`, `run_count_total`, `duration_median_20`, `duration_p90_20`, `duration_history_known` |
-| **Статус батька** | `parent_status_code` (0=pass, 1=fail, −1=unknown), `parent_result_known` |
+| **Статус батька** | `parent_status_code` (0=pass, 1=fail, 2=mixed, −1=unknown), `parent_result_known` |
 | **Характеристики коміту** | `n_changed_files`, `n_prod_files_changed`, `n_test_files_changed`, `has_java`, `has_xml`, `has_build_file` |
 | **Зв'язок тест↔файл** | `test_file_changed`, `same_package_changed`, `same_module_changed`, `path_min_dist`, `path_max_overlap`, `co_fail_rate`, `co_fail_support` |
 
@@ -151,13 +158,14 @@
 
 | Метрика | Опис |
 |---|---|
-| **CMR** | Change Miss Rate — частка дефектних комітів, де жоден обраний тест не впав |
-| **TTFF** | Time-To-First-Failure — сумарна фактична тривалість до першого виявленого падіння (в секундах) |
-| **APFDc** | 1 − Σ(C_i − t_i/2) / (m·T) — стандартна формула cost-cognizant APFD |
+| **CMR** | Change Miss Rate — частка дефектних комітів, де жоден обраний тест не впав (`95%` інтервали: Wilson score CI `cmr_ci_low/high` та moving block bootstrap CI `cmr_boot_ci_low/high`) |
+| **TTFF** | Time-To-First-Failure — модельний послідовний час до першого виявленого падіння (у секундах, без моделювання паралельних воркерів) |
+| **Conditional APFDc** (`conditional_apfdc` / `apfdc`) | `1 − Σ(C_i − t_i/2) / (m·T)` — cost-cognizant APFD, обчислений **по вибраній підмножині тестів** (`T` = сумарна тривалість лише обраних тестів для даного коміту, без кліпування `[0, 1]`) |
+| **Brier Score** (`brier_score_test`) | Середньоквадратична помилка каліброваних імовірностей |
 | **% Tests Selected** | Частка обраних тестів |
 | **% Duration Saved** | Заощаджений час виконання |
 
-> **Важливо:** TTFF та APFDc є **умовними** метриками (обчислюються лише на виявлених дефектних комітах) і **завжди** повідомляються разом із CMR.
+> **Важливо:** **TTFF** та **Conditional APFDc** є **умовними** метриками — вони обчислюються виключно на **виявлених** дефектних комітах, а знаменник `T` у `Conditional APFDc` береться по вибраному піднабору тестів (не по повному набору). Їх **завжди** слід інтерпретувати разом із **CMR** та бюджетом (`% Tests Selected` / `% Duration Saved`).
 
 ---
 
@@ -165,14 +173,16 @@
 
 | Метод | Опис |
 |---|---|
-| `retest_all` | Запуск усіх тестів (100% бюджет) |
+| `retest_all` | Запуск усіх тестів (100% бюджет, алфавітний порядок) |
 | `top_k%` | Топ k% тестів за ймовірністю (k ∈ {10, 30, 50}) |
 | `fixed_0.5` | Фіксований поріг p̂ ≥ 0.5 |
-| `global_conformal` | Конформний глобальний поріг λ |
-| `residual_risk` | Залишковий ризик з конформним τ |
+| `global_conformal` | Конформний глобальний поріг λ (сортування за p̂) |
+| `global_conformal_cost_aware` | Конформний глобальний поріг λ (пріоритизація за `p̂ / duration_median_20`) |
+| `residual_risk` | Залишковий ризик з конформним τ (сортування за p̂) |
+| `residual_risk_cost_aware` | Залишковий ризик з конформним τ (пріоритизація за `p̂ / duration_median_20`) |
 | `naive_residual` | Залишковий ризик без калібрування (τ = α) |
-| `random_matched` | Випадковий вибір з покоммітним бюджетом, що збігається з conformal |
-| `recently_failed` | Тести, що падали в останні 5 комітів |
+| `random_matched` | Випадковий вибір з покоммітним бюджетом, що збігається з `global_conformal` |
+| `recently_failed` | Тести з недавніми падіннями (`fail_rate_20 > 0`, резерв `fail_rate_50 > 0` або `last_fail_dist ≤ 20`) |
 | `threshold_target_recall` | Поріг за цільовим recall на валідації |
 
 ---
@@ -185,17 +195,20 @@
 │   ├── simulator.py                      # CIHistorySimulator (часовий шар даних)
 │   ├── features.py                       # генерація ознак через API симулятора
 │   ├── conformal.py                      # конформне калібрування (λ, τ)
-│   ├── evaluate.py                       # метрики (CMR, TTFF, APFDc) + бейзлайни
-│   ├── models.py                         # LightGBM, isotonic, 4-way спліт
+│   ├── evaluate.py                       # метрики (CMR + CI, TTFF, Conditional APFDc) + бейзлайни
+│   ├── models.py                         # LightGBM, isotonic, 4-way і rolling спліти
 │   ├── run_experiment.py                 # головний скрипт запуску
 │   └── audit_dataset.py                  # аудит датасету
 ├── tests/                                # модульні тести
-│   └── test_all.py                       # pytest: утечки, конформне, метрики
+│   └── test_all.py                       # pytest: утечки, candidate_tests, git parents, конформне, метрики
 ├── outputs/                              # результати експериментів
-│   ├── figures/                          # графіки (PDF, PNG)
-│   ├── results_raw.csv                   # сирі дані
-│   ├── results_table.csv                 # агреговані результати
-│   └── dataset_audit.csv                 # аудит датасету
+│   ├── dataset_audit.csv                 # аудит датасету
+│   └── runs/                             # унікальні папки кожного прогону (<timestamp>_<tag>_seeds<N>/)
+│       └── <run_id>/
+│           ├── results_raw.csv           # сирі дані по (project, seed, alpha, method)
+│           ├── results_table.csv         # агреговані результати (mean ± std)
+│           ├── results_rolling.csv       # ковзні вікна (зі status/skip_reason при --rolling)
+│           └── figures/                  # графіки (PDF, PNG)
 ├── rtp-torrent/                          # дані RTPTorrent (не в git)
 ├── CASTOR_replication_package_v2.0/      # пакет реплікації CASTOR
 ├── filter_defective_commits.py           # (legacy) очищення комітів
@@ -227,26 +240,37 @@ python src/audit_dataset.py
 
 ### 4. Запуск експерименту
 ```bash
-# Швидкий smoke-тест (1 проект, 1 seed) — актуальні результати
+# Швидкий smoke-тест (1 проект, 1 seed; режим git_parent ONLY)
 python src/run_experiment.py --smoke
 
-# Smoke-тест зі скользячими вікнами
+# Smoke-тест зі скользячими (expanding) вікнами
 python src/run_experiment.py --smoke --rolling
 
-# Конкретний проект з 5 seeds і нестрогою політикою міток
-python src/run_experiment.py --project apache@sling --seeds 5 --policy any_fail
+# Налаштування кількості ковзних вікон (за замовчуванням 3)
+python src/run_experiment.py --seeds 5 --rolling --rolling-splits 3
+
+# Конкретний проект з іншою політикою міток або включенням fallback-батьків (аналіз чутливості)
+python src/run_experiment.py --project apache@sling --seeds 5 --policy any_fail --include-fallback-parents
 
 # Повний запуск (5 проектів × 20 seeds × 4 alpha)
 python src/run_experiment.py
 ```
 
-Результати автоматично зберігаються в унікальну папку `outputs/runs/<timestamp>_<tag>/`:
-- `results_raw.csv` — один рядок на (project, seed, alpha, method)
-- `results_table.csv` — mean ± std агреговані по (project, alpha, method)
-- `results_rolling.csv` — результати по ковзних вікнах (тільки з `--rolling`)
+**Основні прапори CLI (`src/run_experiment.py`):**
+- `--smoke` — швидкий прогін (`l0rdn1kk0n@wicket-bootstrap`, `seeds=1`)
+- `--project <id>` — запуск одного конкретного проєкту (напр., `apache@sling`)
+- `--seeds <N>` — кількість випадкових seed-прогонів
+- `--rolling` / `--rolling-splits <K>` — скользяче (expanding-window) оцінювання по `K` неперетинним тестовим вікнам (за замовчуванням `K=3`)
+- `--policy {confirmed_new_fail,strict_all_fail,any_fail}` — політика формування міток (за замовчуванням `confirmed_new_fail`)
+- `--include-fallback-parents` — включати `chronological_fallback` батьків замість суворого режиму `git_parent` (тільки для аналізу чутливості)
+
+Результати автоматично зберігаються в унікальну папку `outputs/runs/<timestamp>_<tag>_seeds<N>/` (наприклад, `outputs/runs/2026-11-23_17-52_all5_seeds5/`):
+- `results_raw.csv` — один рядок на `(project, seed, alpha, method)`
+- `results_table.csv` — `mean ± std` агреговані по `(project, method, alpha)`, включно з `conditional_apfdc_mean`, `brier_score_test_mean`, `cmr_ci_low/high`, `cmr_boot_ci_low/high`
+- `results_rolling.csv` — результати по ковзних вікнах (`--rolling`): логує як виконані вікна (`status="ok"`), так і пропущені (`status="skipped"`, `skip_reason`), а також `min_def_conf_nonzero` та `sufficient_for_nonzero_threshold` для кожного `alpha`
 - `figures/fig1_cmr_vs_alpha.{pdf,png}` — CMR vs α для всіх методів
 - `figures/fig2_budget_vs_alpha.{pdf,png}` — Частка обраних тестів vs α
-- `figures/fig3_apfdc_alpha10.{pdf,png}` — APFDc при α=0.10
+- `figures/fig3_apfdc_alpha10.{pdf,png}` — Conditional APFDc при α=0.10
 - `figures/fig4_reliability_diagram.{pdf,png}` — Діаграма надійності ймовірностей
 - `figures/fig5_rolling_cmr.{pdf,png}` — Динаміка CMR по ковзних вікнах (тільки з `--rolling`)
 
@@ -254,11 +278,11 @@ python src/run_experiment.py
 
 ## Обмеження (Limitations)
 
-1. **Батьківський коміт** визначається в першу чергу з реального Git DAG (bare-репозиторій, `git rev-list --parents`). За його відсутності — хронологічний запасний варіант (за min(job_id)), що може призводити до хибних міток для merge-комітів. Джерело завжди фіксується в `parent_source`.
-2. **`mixed_outcomes_same_sha`** є евристичним сигналом неоднозначності, а не строгим доказом нестабільності (flaky) тесту — RTPTorrent не містить метаданих середовища виконання (OS/JDK) та причин збоїв інфраструктури/збірки, тому відрізнити справжню нестабільність від паралельного збою CI неможливо.
+1. **Батьківський коміт** визначається з реального Git DAG (bare-репозиторій, `git rev-list --parents --all`, перший батько `C^1` для merge-комітів). За замовчуванням у навчанні та оцінці залишаються **тільки** рядки з `parent_source == "git_parent"`; `chronological_fallback` та `none` виключаються (вмикається лише через `--include-fallback-parents` для аналізу чутливості).
+2. **`ambiguous_outcome_same_sha`** (та аліас `mixed_outcomes_same_sha`) є евристичним сигналом неоднозначності результатів на одному SHA (без метаданих OS/JDK чи інфраструктурних збоїв). Такі пари отримують `label = None` (`ambiguous_current`) та виключаються з бінарної оцінки.
 3. **CMR** вимірює частку пропущених дефектів відносно тих, що виявляються повним прогоном наявного тестового набору, а не всіх можливих помилок у коді. Пропущені дефекти, яких немає в тестовому наборі взагалі, не враховуються.
-4. **TTFF** оцінює модельний послідовний час виконання (simulated sequential time) без урахування паралельних воркерів реальної CI-інфраструктури.
-5. **Конформна гарантія** (CMR ≤ α) спирається на припущення про обмінюваність (exchangeability) спостережень. У часовому потоці CI розподіл може дрейфувати, тому стійкість порогів додатково перевіряється скользячим оцінюванням (`--rolling`).
+4. **TTFF і Conditional APFDc** оцінюють модельний послідовний час виконання (без моделювання паралельних CI-воркерів) і обчислюються умовно лише на виявлених дефектних комітах (де `T` — тривалість вибраного піднабору тестів).
+5. **Конформна гарантія** (CMR ≤ α) спирається на припущення про обмінюваність (exchangeability) спостережень та достатнє число дефектних калібрувальних комітів (`n ≥ ⌈1/α⌉ − 1` для ненульового порогу). У часовому потоці CI розподіл може дрейфувати, тому стійкість порогів додатково перевіряється скользячим оцінюванням (`--rolling`).
 6. **Результати є попередніми** до повної мультипроектної валідації на всіх 20 проектах.
-7. **`lines_added` / `lines_deleted`** = 0, оскільки RTPTorrent не містить кількісних метрик diff (тільки назви файлів). Ці стовпці **виключені** з `FEATURE_COLS` — модель їх не бачить.
-8. **Актуальні результати** беруться з найновішої папки `outputs/runs/`, запуск: `python src/run_experiment.py --smoke` (або без `--smoke` для повного прогону). Файли в кореневому `outputs/` можуть бути застарілими.
+7. **`lines_added` / `lines_deleted`** відсутні у RTPTorrent (датасет містить лише імена змінених файлів), тому ці ознаки **виключені** з `FEATURE_COLS`.
+8. **Актуальні результати** зберігаються виключно в папках `outputs/runs/<timestamp>_<tag>_seeds<N>/` (зокрема повний прогін `outputs/runs/2026-11-23_17-52_all5_seeds5/`); застарілі агреговані CSV у корені `outputs/` видалено.
