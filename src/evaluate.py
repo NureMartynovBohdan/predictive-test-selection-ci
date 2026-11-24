@@ -43,6 +43,17 @@ def _drop_missing_labels(
     return df_valid, mask_valid
 
 
+def _candidate_mask(df: pd.DataFrame) -> np.ndarray:
+    """Boolean mask of tests present in the pre-execution candidate inventory.
+
+    Rows with ``in_candidate_inventory == False`` may exist in full ground truth
+    for CMR evaluation, but selectors must never select them.
+    """
+    if "in_candidate_inventory" in df.columns:
+        return df["in_candidate_inventory"].fillna(False).astype(bool).values
+    return np.ones(len(df), dtype=bool)
+
+
 # ---------------------------------------------------------------------------
 # Core Metrics
 # ---------------------------------------------------------------------------
@@ -178,15 +189,29 @@ def compute_budget_saved(
     selected_mask: np.ndarray,
     duration_col: str = "actual_duration",
 ) -> Dict[str, float]:
-    """Budget usage: fraction of tests selected and duration saved."""
-    n_total = len(df)
-    n_selected = int(selected_mask.sum())
+    """Budget usage: fraction of tests selected and duration saved over the
+    observed space (excluding any missing/unobserved rows with NaN labels or NaN duration).
+    """
+    df_valid, mask_valid = _drop_missing_labels(df, selected_mask)
+    if duration_col in df_valid.columns:
+        dur_valid = df_valid[duration_col].notna().values
+        if not dur_valid.all():
+            df_valid = df_valid.loc[dur_valid].copy()
+            mask_valid = mask_valid[dur_valid] if mask_valid is not None else None
+
+    if mask_valid is None:
+        mask_valid = np.zeros(len(df_valid), dtype=bool)
+    else:
+        mask_valid = np.asarray(mask_valid, dtype=bool)
+
+    n_total = len(df_valid)
+    n_selected = int(mask_valid.sum())
     pct_tests_selected = n_selected / n_total if n_total > 0 else 0.0
 
-    if duration_col in df.columns:
-        dur_vals = df[duration_col].fillna(0).values
-        total_dur = dur_vals.sum()
-        sel_dur = dur_vals[selected_mask].sum()
+    if duration_col in df_valid.columns:
+        dur_vals = df_valid[duration_col].fillna(0).values
+        total_dur = float(dur_vals.sum())
+        sel_dur = float(dur_vals[mask_valid].sum())
         pct_dur_sel = sel_dur / total_dur if total_dur > 0 else 0.0
         pct_dur_saved = 1.0 - pct_dur_sel
     else:
@@ -307,7 +332,7 @@ def compute_conditional_apfdc(
 # ---------------------------------------------------------------------------
 
 def baseline_retest_all(df: pd.DataFrame) -> np.ndarray:
-    """Select all tests (100% budget)."""
+    """Full-suite CI reference (100% of executed tests, 0% savings, 0% misses)."""
     return np.ones(len(df), dtype=bool)
 
 
@@ -316,8 +341,10 @@ def baseline_fixed_threshold(
     probs: np.ndarray,
     threshold: float = 0.5,
 ) -> np.ndarray:
-    """Select tests with p_hat >= threshold (no conformal calibration)."""
-    return probs >= threshold
+    """Select candidate tests with p_hat >= threshold (no conformal calibration)."""
+    cand = _candidate_mask(df)
+    eff_probs = np.where(cand, np.asarray(probs, dtype=float), 0.0)
+    return (eff_probs >= threshold) & cand
 
 
 def baseline_top_k_pct(
@@ -325,14 +352,20 @@ def baseline_top_k_pct(
     probs: np.ndarray,
     k_pct: float,
 ) -> np.ndarray:
-    """Select top k% of tests per commit by predicted probability."""
+    """Select top k% of selectable candidate tests per commit by probability."""
+    cand = _candidate_mask(df)
     mask = np.zeros(len(df), dtype=bool)
     df_work = df.copy()
-    df_work["_prob_bk"] = probs
+    df_work["_prob_bk"] = np.where(cand, np.asarray(probs, dtype=float), -np.inf)
+    df_work["_cand"] = cand
     df_work["_iloc"] = np.arange(len(df))
     for cid, grp in df_work.groupby("commit_idx"):
-        n_sel = max(1, int(np.ceil(len(grp) * k_pct)))
-        top_idx = grp.nlargest(n_sel, "_prob_bk")["_iloc"].values.astype(int)
+        cand_grp = grp[grp["_cand"]]
+        if len(cand_grp) == 0:
+            continue
+        n_sel = max(1, int(np.ceil(len(cand_grp) * k_pct)))
+        n_sel = min(n_sel, len(cand_grp))
+        top_idx = cand_grp.nlargest(n_sel, "_prob_bk")["_iloc"].values.astype(int)
         mask[top_idx] = True
     return mask
 
@@ -342,20 +375,24 @@ def baseline_random_matched_budget(
     reference_mask: np.ndarray,
     rng: Optional[np.random.Generator] = None,
 ) -> np.ndarray:
-    """Random selection matching per-commit budget of reference method."""
+    """Random selection within candidate inventory matching per-commit budget of reference."""
     if rng is None:
         rng = np.random.default_rng(42)
 
+    cand = _candidate_mask(df)
     mask = np.zeros(len(df), dtype=bool)
     df_work = df.copy()
-    df_work["_ref"] = reference_mask
+    df_work["_ref"] = np.asarray(reference_mask, dtype=bool) & cand
+    df_work["_cand"] = cand
     df_work["_iloc"] = np.arange(len(df))
 
     for cid, grp in df_work.groupby("commit_idx"):
         k = int(grp["_ref"].sum())
         if k <= 0:
             continue
-        idx_pool = grp["_iloc"].values.astype(int)
+        idx_pool = grp.loc[grp["_cand"], "_iloc"].values.astype(int)
+        if len(idx_pool) == 0:
+            continue
         k = min(k, len(idx_pool))
         chosen = rng.choice(idx_pool, size=k, replace=False)
         mask[chosen] = True
@@ -367,15 +404,20 @@ def baseline_random(
     pct: float = 0.5,
     rng: Optional[np.random.Generator] = None,
 ) -> np.ndarray:
-    """Randomly select pct fraction of tests per commit."""
+    """Randomly select pct fraction of candidate tests per commit."""
     if rng is None:
         rng = np.random.default_rng(42)
+    cand = _candidate_mask(df)
     mask = np.zeros(len(df), dtype=bool)
     df_work = df.copy()
+    df_work["_cand"] = cand
     df_work["_iloc"] = np.arange(len(df))
     for cid, grp in df_work.groupby("commit_idx"):
-        idx = grp["_iloc"].values.astype(int)
+        idx = grp.loc[grp["_cand"], "_iloc"].values.astype(int)
+        if len(idx) == 0:
+            continue
         k = max(1, int(len(idx) * pct))
+        k = min(k, len(idx))
         chosen = rng.choice(idx, size=k, replace=False)
         mask[chosen] = True
     return mask
@@ -385,21 +427,22 @@ def baseline_recently_failed(
     df: pd.DataFrame,
     n_recent: int = 20,
 ) -> np.ndarray:
-    """Select tests that failed recently in the historical window.
+    """Select candidate tests that failed recently in the historical window.
 
     Prefers fail_rate_20 > 0 (or fail_rate_50 > 0), falling back to
     last_fail_dist > 0 if fail-rate columns are absent.
     """
+    cand = _candidate_mask(df)
     mask = np.zeros(len(df), dtype=bool)
     if "fail_rate_20" in df.columns:
-        mask = (df["fail_rate_20"] > 0).values
-        if not mask.any() and "fail_rate_50" in df.columns:
-            mask = (df["fail_rate_50"] > 0).values
+        mask = (df["fail_rate_20"].fillna(0.0) > 0).values
+        if not (mask & cand).any() and "fail_rate_50" in df.columns:
+            mask = (df["fail_rate_50"].fillna(0.0) > 0).values
     elif "fail_rate_50" in df.columns:
-        mask = (df["fail_rate_50"] > 0).values
+        mask = (df["fail_rate_50"].fillna(0.0) > 0).values
     elif "last_fail_dist" in df.columns:
         mask = ((df["last_fail_dist"] <= n_recent) & (df["last_fail_dist"] > 0)).values
-    return mask
+    return mask & cand
 
 
 def baseline_naive_residual(
@@ -410,7 +453,7 @@ def baseline_naive_residual(
     """Naive residual risk: tau = alpha directly (no conformal calibration)."""
     from conformal import select_tests_residual_all_commits
     sel = select_tests_residual_all_commits(df, probs, tau=alpha)
-    return df.index.isin(sel.index)
+    return df.index.isin(sel.index) & _candidate_mask(df)
 
 
 def baseline_threshold_target_recall(
@@ -420,20 +463,26 @@ def baseline_threshold_target_recall(
     probs_test: np.ndarray,
     target_recall: float = 0.90,
 ) -> np.ndarray:
-    """Find threshold on validation achieving target change-level recall,
-    then apply to test set.
+    """Find threshold on validation candidates achieving target change-level recall,
+    then apply to test candidates (never selects non-candidates).
     """
-    thresholds = np.sort(np.unique(probs_val))
+    cand_val = _candidate_mask(df_val)
+    cand_test = _candidate_mask(df_test)
+    eff_val = np.where(cand_val, np.asarray(probs_val, dtype=float), 0.0)
+    eff_test = np.where(cand_test, np.asarray(probs_test, dtype=float), 0.0)
+
+    cand_vals = np.unique(eff_val[cand_val]) if cand_val.any() else np.array([0.0])
+    thresholds = np.sort(np.unique(np.concatenate(([0.0], cand_vals))))
     best_thr = 0.0
     for thr in thresholds:
-        mask = probs_val >= thr
+        mask = (eff_val >= thr) & cand_val
         cmr = compute_cmr(df_val, mask)
         recall = 1.0 - cmr
         if recall >= target_recall:
-            best_thr = thr
+            best_thr = float(thr)
         else:
             break
-    return probs_test >= best_thr
+    return (eff_test >= best_thr) & cand_test
 
 
 # ---------------------------------------------------------------------------
@@ -586,18 +635,20 @@ def compare_all_methods(
     )
 
     results: list[Dict[str, Any]] = []
+    cand_mask = _candidate_mask(df_test)
+    probs_eval = np.where(cand_mask, np.asarray(probs_test, dtype=float), 0.0)
     df_test_p = df_test.copy()
-    df_test_p["_prob"] = probs_test
+    df_test_p["_prob"] = probs_eval
 
-    # 1. Retest-all (standard alphabetical execution order, no ML prioritization)
+    # 1. Retest-all (full CI suite reference without test selection)
     mask_all = baseline_retest_all(df_test)
     results.append(evaluate_selection(
         df_test_p, mask_all, "retest_all", alpha, duration_col, order_by="default"
     ))
 
-    # 2. Global conformal (probability ordering)
-    sel_global = select_tests_global(df_test, probs_test, threshold_global)
-    mask_global = df_test.index.isin(sel_global.index)
+    # 2. Global conformal (probability ordering; strictly within candidate inventory)
+    sel_global = select_tests_global(df_test, probs_eval, threshold_global)
+    mask_global = df_test.index.isin(sel_global.index) & cand_mask
     results.append(evaluate_selection(
         df_test_p, mask_global, "global_conformal", alpha, duration_col, order_by="prob"
     ))
@@ -607,9 +658,9 @@ def compare_all_methods(
         df_test_p, mask_global, "global_conformal_cost_aware", alpha, duration_col, order_by="cost_aware"
     ))
 
-    # 4. Residual risk conformal (probability ordering)
-    sel_res = select_tests_residual_all_commits(df_test, probs_test, tau_residual)
-    mask_residual = df_test.index.isin(sel_res.index)
+    # 4. Residual risk conformal (probability ordering; strictly within candidate inventory)
+    sel_res = select_tests_residual_all_commits(df_test, probs_eval, tau_residual)
+    mask_residual = df_test.index.isin(sel_res.index) & cand_mask
     results.append(evaluate_selection(
         df_test_p, mask_residual, "residual_risk", alpha, duration_col, order_by="prob"
     ))
@@ -620,14 +671,14 @@ def compare_all_methods(
     ))
 
     # 6. Naive residual risk (tau = alpha)
-    sel_naive = select_tests_residual_all_commits(df_test, probs_test, alpha)
-    mask_naive = df_test.index.isin(sel_naive.index)
+    sel_naive = select_tests_residual_all_commits(df_test, probs_eval, alpha)
+    mask_naive = df_test.index.isin(sel_naive.index) & cand_mask
     results.append(evaluate_selection(
         df_test_p, mask_naive, "naive_residual", alpha, duration_col, order_by="prob"
     ))
 
     # 7. Fixed threshold 0.5
-    mask_fixed = baseline_fixed_threshold(df_test, probs_test, threshold=0.5)
+    mask_fixed = baseline_fixed_threshold(df_test, probs_eval, threshold=0.5) & cand_mask
     results.append(evaluate_selection(
         df_test_p, mask_fixed, "fixed_0.5", alpha, duration_col, order_by="prob"
     ))
@@ -636,20 +687,20 @@ def compare_all_methods(
     if top_k_budgets is None:
         top_k_budgets = [0.10, 0.30, 0.50]
     for k_pct in top_k_budgets:
-        mask_topk = baseline_top_k_pct(df_test, probs_test, k_pct)
+        mask_topk = baseline_top_k_pct(df_test, probs_eval, k_pct) & cand_mask
         label = f"top_{int(k_pct*100)}pct"
         results.append(evaluate_selection(
             df_test_p, mask_topk, label, alpha, duration_col, order_by="prob"
         ))
 
     # 9. Random matched budget (matches global conformal, random execution order)
-    mask_rand = baseline_random_matched_budget(df_test, mask_global, rng=rng)
+    mask_rand = baseline_random_matched_budget(df_test, mask_global, rng=rng) & cand_mask
     results.append(evaluate_selection(
         df_test_p, mask_rand, "random_matched", alpha, duration_col, order_by="random", rng=rng
     ))
 
     # 10. Recently failed (ordered by recency of failure)
-    mask_recent = baseline_recently_failed(df_test)
+    mask_recent = baseline_recently_failed(df_test) & cand_mask
     results.append(evaluate_selection(
         df_test_p, mask_recent, "recently_failed", alpha, duration_col, order_by="recently_failed"
     ))
@@ -657,8 +708,8 @@ def compare_all_methods(
     # 11. Threshold by target recall (if validation set provided)
     if df_val is not None and probs_val is not None:
         mask_tgt = baseline_threshold_target_recall(
-            df_val, probs_val, df_test, probs_test, target_recall=1.0 - alpha
-        )
+            df_val, probs_val, df_test, probs_eval, target_recall=1.0 - alpha
+        ) & cand_mask
         results.append(evaluate_selection(
             df_test_p, mask_tgt, "threshold_target_recall", alpha, duration_col, order_by="prob"
         ))

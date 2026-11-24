@@ -150,6 +150,15 @@ def rolling_time_splits(
 # LightGBM training
 # ---------------------------------------------------------------------------
 
+def _filter_candidate_inventory(df: pd.DataFrame) -> pd.DataFrame:
+    """Restrict training / probability calibration data strictly to tests in
+    ``in_candidate_inventory == True`` when that column is present.
+    """
+    if "in_candidate_inventory" in df.columns:
+        return df[df["in_candidate_inventory"].fillna(False).astype(bool)]
+    return df
+
+
 def train_lgbm(
     train: pd.DataFrame,
     feature_cols: List[str],
@@ -159,15 +168,16 @@ def train_lgbm(
     learning_rate: float = 0.05,
     min_child_samples: int = 10,
 ) -> "lgb.LGBMClassifier":
-    """Train a LightGBM classifier.
+    """Train a LightGBM classifier strictly on ``in_candidate_inventory == True`` rows.
 
     **Does NOT use** ``.fillna(0)`` — LightGBM handles ``NaN`` natively.
     """
     if not HAS_LGB:
         raise RuntimeError("lightgbm not installed")
 
-    X = train[feature_cols]  # NO fillna
-    y = train["label"]
+    train_use = _filter_candidate_inventory(train)
+    X = train_use[feature_cols]  # NO fillna
+    y = train_use["label"]
 
     pos = int(y.sum())
     neg = int(len(y) - pos)
@@ -196,14 +206,31 @@ def calibrate_isotonic(
     calib: pd.DataFrame,
     feature_cols: List[str],
 ) -> IsotonicRegression:
-    """Fit IsotonicRegression on calibration-set raw probabilities."""
-    X_cal = calib[feature_cols]  # NO fillna
-    y_cal = calib["label"]
+    """Fit IsotonicRegression strictly on ``in_candidate_inventory == True`` rows."""
+    calib_use = _filter_candidate_inventory(calib)
+    X_cal = calib_use[feature_cols]  # NO fillna
+    y_cal = calib_use["label"]
 
     raw_probs = model.predict_proba(X_cal)[:, 1]
     iso = IsotonicRegression(out_of_bounds="clip")
     iso.fit(raw_probs, y_cal)
     return iso
+
+
+def predict_raw_and_calibrated(
+    model,
+    iso: IsotonicRegression,
+    df: pd.DataFrame,
+    feature_cols: List[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return ``(raw_probs, calibrated_probs)`` for all rows in df."""
+    if len(df) == 0:
+        empty = np.array([], dtype=float)
+        return empty, empty
+    X = df[feature_cols]  # NO fillna
+    raw = np.asarray(model.predict_proba(X)[:, 1], dtype=float)
+    cal = np.asarray(iso.predict(raw), dtype=float)
+    return raw, cal
 
 
 def predict_calibrated(
@@ -213,13 +240,12 @@ def predict_calibrated(
     feature_cols: List[str],
 ) -> np.ndarray:
     """Return calibrated probabilities for all rows in df."""
-    X = df[feature_cols]  # NO fillna
-    raw = model.predict_proba(X)[:, 1]
-    return iso.predict(raw)
+    _, cal = predict_raw_and_calibrated(model, iso, df, feature_cols)
+    return cal
 
 
 # ---------------------------------------------------------------------------
-# PR-AUC evaluation
+# PR-AUC & Brier evaluation (including baseline references)
 # ---------------------------------------------------------------------------
 
 def compute_pr_auc(labels: np.ndarray, probs: np.ndarray) -> float:
@@ -228,6 +254,14 @@ def compute_pr_auc(labels: np.ndarray, probs: np.ndarray) -> float:
     if labels.sum() == 0:
         return 0.0
     return float(average_precision_score(labels, probs))
+
+
+def compute_pr_auc_baseline(labels: np.ndarray) -> float:
+    """Random/no-skill PR-AUC baseline = positive class prevalence in labels."""
+    arr = np.asarray(labels, dtype=float)
+    if arr.size == 0:
+        return float("nan")
+    return float(np.mean(arr == 1))
 
 
 def compute_brier_score(labels: np.ndarray, probs: np.ndarray) -> float:
@@ -243,3 +277,16 @@ def compute_brier_score(labels: np.ndarray, probs: np.ndarray) -> float:
     if len(labels) == 0:
         return float("nan")
     return float(np.mean((probs - labels) ** 2))
+
+
+def compute_brier_baseline(train_labels: np.ndarray, test_labels: np.ndarray) -> float:
+    """Constant-prevalence Brier baseline: predict the empirical positive rate
+    from ``train_labels`` on every sample in ``test_labels``.
+    """
+    tr = np.asarray(train_labels, dtype=float)
+    te = np.asarray(test_labels, dtype=float)
+    if tr.size == 0 or te.size == 0:
+        return float("nan")
+    prior = float(np.mean(tr == 1))
+    const_preds = np.full(te.shape, prior, dtype=float)
+    return compute_brier_score(te, const_preds)

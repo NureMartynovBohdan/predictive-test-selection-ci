@@ -58,8 +58,11 @@ from models import (
     train_lgbm,
     calibrate_isotonic,
     predict_calibrated,
+    predict_raw_and_calibrated,
     compute_pr_auc,
+    compute_pr_auc_baseline,
     compute_brier_score,
+    compute_brier_baseline,
 )
 from conformal import (
     compute_conformal_scores,
@@ -125,80 +128,162 @@ def build_project_data(
     sim: CIHistorySimulator,
     policy: str = "confirmed_new_fail",
 ) -> pd.DataFrame:
-    """Build complete feature+label dataset for one project.
+    """Build complete feature+label dataset for one project by uniting
+    pre-execution ``get_candidate_tests(sha)`` with full ``reveal_ground_truth(sha)``.
 
-    Safely handles candidate tests returned by pre-execution inventory
-    that were not observed in ground-truth CI results (marked as
-    ``label=None``, ``label_status='unobserved_candidate'``).
+    Sets ``in_candidate_inventory``:
+      - ``True``  for tests returned by ``get_candidate_tests(sha)`` (including
+                  unobserved candidates marked ``label=None``, ``label_status='unobserved_candidate'``)
+      - ``False`` for tests that ran in CI logs (``reveal_ground_truth``) but were
+                  absent from ``get_candidate_tests(sha)`` (never selectable, yet
+                  counted in full ground truth during conformal calibration and CMR).
     """
     all_commits = sim.get_all_commits()
     print(f"    [features] building for {len(all_commits)} commits...", flush=True)
 
     df_features = build_features_batch(sim, all_commits, verbose=True)
-    if len(df_features) == 0:
-        return df_features
 
     # Pre-fetch ground truth once per commit (O(C) instead of O(N))
     print(f"    [ground_truth] revealing ground truth for {len(all_commits)} commits...", flush=True)
     gt_by_commit = {sha: sim.reveal_ground_truth(sha, policy=policy) for sha in all_commits}
 
-    labels: list = []
-    durations: list[float] = []
-    statuses: list[str] = []
-    parent_statuses: list[str] = []
-    current_statuses: list[str] = []
-    parent_shas: list[Optional[str]] = []
-    ambiguous_flags: list[bool] = []
-    parent_sources: list[str] = []
-
     has_get_parent_source = hasattr(sim, "get_parent_source")
+    cand_pairs_by_commit: Dict[str, set] = {}
 
-    for row in df_features.itertuples(index=False):
-        sha = row.commit
-        test_name = row.testName
+    if len(df_features) > 0:
+        for sha_val, tname_val in zip(df_features["commit"], df_features["testName"]):
+            cand_pairs_by_commit.setdefault(sha_val, set()).add(tname_val)
+
+        labels: list = []
+        durations: list[float] = []
+        statuses: list[str] = []
+        parent_statuses: list[str] = []
+        current_statuses: list[str] = []
+        parent_shas: list[Optional[str]] = []
+        ambiguous_flags: list[bool] = []
+        parent_sources: list[str] = []
+
+        for row in df_features.itertuples(index=False):
+            sha = row.commit
+            test_name = row.testName
+            gt = gt_by_commit.get(sha)
+            if gt is not None and test_name in gt.test_results:
+                tr = gt.test_results[test_name]
+                labels.append(tr.label)
+                durations.append(tr.actual_duration)
+                statuses.append(tr.label_status)
+                parent_statuses.append(tr.parent_status)
+                current_statuses.append(tr.current_status)
+                parent_shas.append(tr.parent_sha)
+                ambig = getattr(
+                    tr,
+                    "ambiguous_outcome_same_sha",
+                    getattr(tr, "mixed_outcomes_same_sha", False),
+                )
+                ambiguous_flags.append(bool(ambig))
+                parent_sources.append(tr.parent_source)
+            else:
+                # Candidate test from pre-run inventory not observed in CI logs for this SHA
+                labels.append(None)
+                durations.append(float("nan"))
+                statuses.append("unobserved_candidate")
+                parent_statuses.append("unknown")
+                current_statuses.append("unobserved")
+                parent_shas.append(None)
+                ambiguous_flags.append(False)
+                p_src = sim.get_parent_source(sha) if has_get_parent_source else "none"
+                parent_sources.append(p_src)
+
+        df_features = df_features.copy()
+        df_features["in_candidate_inventory"] = True
+        df_features["label"] = pd.Series(labels, dtype="object")
+        df_features["actual_duration"] = durations
+        df_features["label_status"] = statuses
+        df_features["label_attribution"] = statuses  # backward-compatible alias
+        df_features["parent_status"] = parent_statuses
+        df_features["current_status"] = current_statuses
+        df_features["parent_sha"] = parent_shas
+        df_features["ambiguous_outcome_same_sha"] = ambiguous_flags
+        df_features["mixed_outcomes_same_sha"] = ambiguous_flags  # backward-compatible alias
+        df_features["parent_source"] = parent_sources
+
+    # Union tests that appeared ONLY in reveal_ground_truth(sha)
+    extra_rows: list[dict] = []
+    for sha in all_commits:
         gt = gt_by_commit.get(sha)
-        if gt is not None and test_name in gt.test_results:
-            tr = gt.test_results[test_name]
-            labels.append(tr.label)
-            durations.append(tr.actual_duration)
-            statuses.append(tr.label_status)
-            parent_statuses.append(tr.parent_status)
-            current_statuses.append(tr.current_status)
-            parent_shas.append(tr.parent_sha)
-            ambig = getattr(
+        if gt is None:
+            continue
+        seen_cands = cand_pairs_by_commit.get(sha, ())
+        c_idx = sim.get_commit_order(sha)
+        for test_name, tr in gt.test_results.items():
+            if test_name in seen_cands:
+                continue
+            ambig = bool(getattr(
                 tr,
                 "ambiguous_outcome_same_sha",
                 getattr(tr, "mixed_outcomes_same_sha", False),
-            )
-            ambiguous_flags.append(bool(ambig))
-            parent_sources.append(tr.parent_source)
+            ))
+            rec: dict = {
+                "commit": sha,
+                "commit_idx": c_idx,
+                "testName": test_name,
+            }
+            for col in FEATURE_COLS:
+                rec[col] = np.nan
+            rec.update({
+                "in_candidate_inventory": False,
+                "label": tr.label,
+                "actual_duration": tr.actual_duration,
+                "label_status": tr.label_status,
+                "label_attribution": tr.label_status,
+                "parent_status": tr.parent_status,
+                "current_status": tr.current_status,
+                "parent_sha": tr.parent_sha,
+                "ambiguous_outcome_same_sha": ambig,
+                "mixed_outcomes_same_sha": ambig,
+                "parent_source": tr.parent_source,
+            })
+            extra_rows.append(rec)
+
+    if len(df_features) == 0 and not extra_rows:
+        return df_features
+
+    if extra_rows:
+        df_extra = pd.DataFrame(extra_rows)
+        df_extra["label"] = pd.Series(df_extra["label"].tolist(), dtype="object")
+        if len(df_features) > 0:
+            df_out = pd.concat([df_features, df_extra], ignore_index=True)
+            df_out = df_out.sort_values(["commit_idx", "testName"], kind="mergesort").reset_index(drop=True)
         else:
-            # Candidate test from pre-run inventory not observed in CI logs for this SHA
-            labels.append(None)
-            durations.append(float("nan"))
-            statuses.append("unobserved_candidate")
-            parent_statuses.append("unknown")
-            current_statuses.append("unobserved")
-            parent_shas.append(None)
-            ambiguous_flags.append(False)
-            p_src = sim.get_parent_source(sha) if has_get_parent_source else "none"
-            parent_sources.append(p_src)
+            df_out = df_extra.sort_values(["commit_idx", "testName"], kind="mergesort").reset_index(drop=True)
+    else:
+        df_out = df_features
 
-    df_features["label"] = pd.Series(labels, dtype="object")
-    df_features["actual_duration"] = durations
-    df_features["label_status"] = statuses
-    df_features["label_attribution"] = statuses  # backward-compatible alias
-    df_features["parent_status"] = parent_statuses
-    df_features["current_status"] = current_statuses
-    df_features["parent_sha"] = parent_shas
-    df_features["ambiguous_outcome_same_sha"] = ambiguous_flags
-    df_features["mixed_outcomes_same_sha"] = ambiguous_flags  # backward-compatible alias
-    df_features["parent_source"] = parent_sources
+    df_out["in_candidate_inventory"] = df_out["in_candidate_inventory"].astype(bool)
 
-    ps_counts = df_features.groupby("commit")["parent_source"].first().value_counts()
+    ps_counts = df_out.groupby("commit")["parent_source"].first().value_counts()
     print(f"    [parent_source] { {str(k): int(v) for k, v in ps_counts.items()} }", flush=True)
 
-    return df_features
+    # Candidate inventory completeness statistics (over observed ground-truth runs)
+    obs_mask = df_out["current_status"] != "unobserved"
+    df_obs = df_out.loc[obs_mask]
+    n_obs = len(df_obs)
+    out_obs = df_obs[~df_obs["in_candidate_inventory"]]
+    n_out = len(out_obs)
+    pos_obs = df_obs[df_obs["label"] == 1]
+    n_pos = len(pos_obs)
+    out_pos = pos_obs[~pos_obs["in_candidate_inventory"]]
+    n_out_pos = len(out_pos)
+    n_out_pos_commits = int(out_pos["commit"].nunique()) if n_out_pos > 0 else 0
+    pct_out = (100.0 * n_out / n_obs) if n_obs > 0 else 0.0
+    print(
+        f"    [inventory] observed_gt_pairs={n_obs}, outside_candidate_inventory={n_out} "
+        f"({pct_out:.2f}%), confirmed_fail_pairs={n_pos}, "
+        f"confirmed_fail_outside_inventory={n_out_pos} (commits={n_out_pos_commits})",
+        flush=True,
+    )
+
+    return df_out
 
 
 def filter_valid_pairs(
@@ -278,8 +363,44 @@ def filter_valid_pairs(
                 f"    - {reason}: {cnts['pairs']} pairs across {cnts['commits']} commits",
                 flush=True,
             )
+        if "in_candidate_inventory" in work.columns and len(work) > 0:
+            outside = work[~work["in_candidate_inventory"].astype(bool)]
+            outside_pos = outside[outside["label"] == 1]
+            print(
+                f"    - [inventory_after_filter] outside_candidate_inventory={len(outside)}/{len(work)} pairs "
+                f"({100.0 * len(outside) / len(work):.2f}%), "
+                f"confirmed_fail_outside={len(outside_pos)}/{int((work['label'] == 1).sum())}",
+                flush=True,
+            )
 
     return work, stats
+
+
+def _predict_split_probs(
+    model,
+    calibrator,
+    df_split: pd.DataFrame,
+    feature_cols: List[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Predict ``(probs_calibrated, probs_raw)`` strictly on
+    ``in_candidate_inventory == True`` rows; non-candidate rows receive 0.0.
+    """
+    n = len(df_split)
+    probs_cal = np.zeros(n, dtype=float)
+    probs_raw = np.zeros(n, dtype=float)
+    if n == 0:
+        return probs_cal, probs_raw
+    if "in_candidate_inventory" in df_split.columns:
+        cand_mask = df_split["in_candidate_inventory"].fillna(False).astype(bool).values
+    else:
+        cand_mask = np.ones(n, dtype=bool)
+    if cand_mask.any():
+        raw_sub, cal_sub = predict_raw_and_calibrated(
+            model, calibrator, df_split.loc[cand_mask], feature_cols
+        )
+        probs_raw[cand_mask] = raw_sub
+        probs_cal[cand_mask] = cal_sub
+    return probs_cal, probs_raw
 
 
 # ---------------------------------------------------------------------------
@@ -330,25 +451,41 @@ def run_one(
     if n_def_test < MIN_DEFECTIVE_TEST:
         raise ValueError(f"Too few defective in test: {n_def_test}")
 
+    # Restrict model training and probability calibration strictly to in_candidate_inventory == True
+    if "in_candidate_inventory" in df.columns:
+        train_cand = train_df[train_df["in_candidate_inventory"].fillna(False).astype(bool)].copy()
+        prob_cand = prob_calib_df[prob_calib_df["in_candidate_inventory"].fillna(False).astype(bool)].copy()
+    else:
+        train_cand = train_df
+        prob_cand = prob_calib_df
+
     # --- Train LightGBM ---
-    print(f"    [train] seed={seed}", flush=True)
-    model = train_lgbm(train_df, FEATURE_COLS, seed=seed)
+    print(f"    [train] seed={seed} (candidates={len(train_cand)}/{len(train_df)})", flush=True)
+    model = train_lgbm(train_cand, FEATURE_COLS, seed=seed)
 
-    # --- Isotonic calibration (on prob_calib set) ---
-    print("    [calibrate]", flush=True)
-    calibrator = calibrate_isotonic(model, prob_calib_df, FEATURE_COLS)
+    # --- Isotonic calibration (on prob_calib candidate set) ---
+    print(f"    [calibrate] (candidates={len(prob_cand)}/{len(prob_calib_df)})", flush=True)
+    calibrator = calibrate_isotonic(model, prob_cand, FEATURE_COLS)
 
-    # --- Predict ---
-    probs_conf_calib = predict_calibrated(model, calibrator, conf_calib_df, FEATURE_COLS)
-    probs_test = predict_calibrated(model, calibrator, test_df, FEATURE_COLS)
+    # --- Predict (forced 0.0 outside candidate inventory) ---
+    probs_conf_calib, _ = _predict_split_probs(model, calibrator, conf_calib_df, FEATURE_COLS)
+    probs_test, probs_raw_test = _predict_split_probs(model, calibrator, test_df, FEATURE_COLS)
 
     if diag_out is not None:
         diag_out["y_true"] = test_df["label"].values
         diag_out["probs"] = probs_test
 
-    pr_auc_test = compute_pr_auc(test_df["label"].values, probs_test)
-    brier_test = compute_brier_score(test_df["label"].values, probs_test)
-    print(f"    [pr_auc] test={pr_auc_test:.4f}  brier={brier_test:.4f}", flush=True)
+    y_test = test_df["label"].values
+    pr_auc_test = compute_pr_auc(y_test, probs_test)
+    pr_auc_baseline_test = compute_pr_auc_baseline(y_test)
+    brier_test = compute_brier_score(y_test, probs_test)
+    brier_raw_test = compute_brier_score(y_test, probs_raw_test)
+    brier_baseline_test = compute_brier_baseline(train_cand["label"].values, y_test)
+    print(
+        f"    [pr_auc] test={pr_auc_test:.6f} (baseline={pr_auc_baseline_test:.6f})  "
+        f"brier: iso={brier_test:.6f}, raw={brier_raw_test:.6f}, baseline={brier_baseline_test:.6f}",
+        flush=True,
+    )
 
     # --- Conformal + evaluation per alpha ---
     all_rows: list[dict] = []
@@ -381,7 +518,10 @@ def run_one(
             row["project"] = project
             row["seed"] = seed
             row["pr_auc_test"] = pr_auc_test
+            row["pr_auc_baseline_test"] = pr_auc_baseline_test
             row["brier_score_test"] = brier_test
+            row["brier_raw_test"] = brier_raw_test
+            row["brier_baseline_test"] = brier_baseline_test
             row["n_def_conf_calib"] = n_def_conf
             row["n_def_test"] = n_def_test
             row["min_def_conf_nonzero"] = min_n
@@ -509,7 +649,10 @@ def aggregate_results(all_results: list) -> pd.DataFrame:
     ]
     for opt_col in [
         "conditional_apfdc",
+        "pr_auc_baseline_test",
         "brier_score_test",
+        "brier_raw_test",
+        "brier_baseline_test",
         "cmr_ci_low",
         "cmr_ci_high",
         "cmr_boot_ci_low",
@@ -697,10 +840,17 @@ def run_rolling(
             continue
 
         try:
-            model = train_lgbm(train_df, FEATURE_COLS, seed=seed)
-            calibrator = calibrate_isotonic(model, prob_calib_df, FEATURE_COLS)
-            probs_conf = predict_calibrated(model, calibrator, conf_calib_df, FEATURE_COLS)
-            probs_test = predict_calibrated(model, calibrator, test_df, FEATURE_COLS)
+            if "in_candidate_inventory" in train_df.columns:
+                train_cand = train_df[train_df["in_candidate_inventory"].fillna(False).astype(bool)].copy()
+                prob_cand = prob_calib_df[prob_calib_df["in_candidate_inventory"].fillna(False).astype(bool)].copy()
+            else:
+                train_cand = train_df
+                prob_cand = prob_calib_df
+
+            model = train_lgbm(train_cand, FEATURE_COLS, seed=seed)
+            calibrator = calibrate_isotonic(model, prob_cand, FEATURE_COLS)
+            probs_conf, _ = _predict_split_probs(model, calibrator, conf_calib_df, FEATURE_COLS)
+            probs_test, _ = _predict_split_probs(model, calibrator, test_df, FEATURE_COLS)
 
             for alpha in ALPHAS:
                 scores = compute_conformal_scores(conf_calib_df, probs_conf)
@@ -763,6 +913,23 @@ def run_rolling(
                         "tau": float("nan"),
                         "cmr_minus_alpha": float("nan"),
                     })
+
+    if rows:
+        for alpha in ALPHAS:
+            min_n = min_defective_for_nonzero_threshold(alpha)
+            win_flags = {
+                r["window"]: r["sufficient_for_nonzero_threshold"]
+                for r in rows
+                if abs(r["alpha"] - alpha) < 1e-12
+            }
+            n_tot_w = len(win_flags)
+            n_insuff_w = sum(1 for ok in win_flags.values() if not ok)
+            print(
+                f"    [rolling-summary] {project} (seed={seed}) alpha={alpha:.2f}: "
+                f"sufficient_for_nonzero_threshold==False in {n_insuff_w}/{n_tot_w} windows "
+                f"(min_def_conf={min_n})",
+                flush=True,
+            )
     return rows
 
 

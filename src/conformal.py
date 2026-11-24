@@ -19,22 +19,37 @@ from typing import Tuple
 # Deterministic tie-breaking
 # ---------------------------------------------------------------------------
 
+def _effective_candidate_mask(df: pd.DataFrame) -> np.ndarray:
+    """Boolean mask of tests present in the pre-execution candidate inventory.
+
+    If ``in_candidate_inventory`` is absent (legacy callers / unit tests),
+    all rows are treated as selectable candidates.
+    """
+    if "in_candidate_inventory" in df.columns:
+        return df["in_candidate_inventory"].fillna(False).astype(bool).values
+    return np.ones(len(df), dtype=bool)
+
+
 def _deterministic_sort(
     df: pd.DataFrame,
     probs: np.ndarray,
 ) -> pd.DataFrame:
-    """Sort by ``(-prob, test_name)`` for deterministic ordering.
+    """Sort by ``(-prob, test_name)`` for deterministic ordering, placing any
+    non-candidate rows (``in_candidate_inventory == False``) strictly after
+    selectable candidates.
 
     Used in **both** calibration and test-time selection so that
     ties (common after isotonic regression) are always broken
     identically.
     """
     df = df.copy()
-    df["_prob"] = probs
+    cand_mask = _effective_candidate_mask(df)
+    df["_prob"] = np.where(cand_mask, np.asarray(probs, dtype=float), 0.0)
+    df["_cand_sort"] = cand_mask.astype(int)
     df["_sort_key"] = df["testName"].astype(str) if "testName" in df.columns else ""
     df = df.sort_values(
-        ["_prob", "_sort_key"],
-        ascending=[False, True],
+        ["_cand_sort", "_prob", "_sort_key"],
+        ascending=[False, False, True],
     )
     return df
 
@@ -52,10 +67,15 @@ def compute_conformal_scores(
     For each defective commit *c*:
         ``S_c = max_{i ∈ Failed(c)} p̂_{c,i}``
 
+    Tests outside ``in_candidate_inventory`` have probability forced to 0.0
+    (unselectable), so a commit failing solely on non-candidates receives
+    ``S_c = 0.0`` rather than being dropped.
+
     Returns 1-D array of S_c values, one per defective commit.
     """
     df = df.copy()
-    df["_prob"] = probs
+    cand_mask = _effective_candidate_mask(df)
+    df["_prob"] = np.where(cand_mask, np.asarray(probs, dtype=float), 0.0)
 
     scores = []
     for commit_idx, grp in df.groupby("commit_idx", sort=True):
@@ -110,10 +130,11 @@ def select_tests_global(
     probs: np.ndarray,
     threshold: float,
 ) -> pd.DataFrame:
-    """Select tests with p̂ ≥ threshold."""
+    """Select candidate tests with p̂ ≥ threshold (never selects non-candidates)."""
     df = df.copy()
-    df["_prob"] = probs
-    return df[df["_prob"] >= threshold].copy()
+    cand_mask = _effective_candidate_mask(df)
+    df["_prob"] = np.where(cand_mask, np.asarray(probs, dtype=float), 0.0)
+    return df[(df["_prob"] >= threshold) & cand_mask].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +196,8 @@ def compute_tau_residual(
     if not np.all(np.isfinite(probs)):
         raise ValueError("probs contains NaN or Inf values")
     df = df.copy()
-    df["_prob"] = probs
+    cand_mask = _effective_candidate_mask(df)
+    df["_prob"] = np.where(cand_mask, probs, 0.0)
 
     defective_commits = (
         df.groupby("commit_idx")
@@ -254,6 +276,10 @@ def select_tests_residual(
 
     selected = df.iloc[:cutoff].copy()
     selected["_rank"] = np.arange(1, cutoff + 1)
+    if "in_candidate_inventory" in selected.columns:
+        cand_sel = selected["in_candidate_inventory"].fillna(False).astype(bool)
+        selected = selected.loc[cand_sel].copy()
+        selected["_rank"] = np.arange(1, len(selected) + 1)
     return selected
 
 
@@ -264,7 +290,8 @@ def select_tests_residual_all_commits(
 ) -> pd.DataFrame:
     """Apply residual-risk selection per commit."""
     df = df.copy()
-    df["_prob"] = probs
+    cand_mask = _effective_candidate_mask(df)
+    df["_prob"] = np.where(cand_mask, probs, 0.0)
     parts = []
     for cid, grp in df.groupby("commit_idx", sort=True):
         sel = select_tests_residual(grp, grp["_prob"].values, tau)

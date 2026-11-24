@@ -82,10 +82,12 @@
 | `confirmed_new_fail` | `1` | Тест стабільно падає зараз, на батьку підтверджено `pass` |
 | `no_new_fail` | `0` | Тест стабільно проходить зараз (нових регресій немає) |
 | `already_failing` | `0` | Тест падав і на батьку, і зараз — не нове падіння |
-| `ambiguous_current` | `None` *(викл.)* | Змішані результати (`pass` і `fail`) на поточному SHA |
-| `parent_mixed` | `None` *(викл.)* | Поточний результат за неоднозначного (`mixed`) статусу батька |
-| `unknown_parent` | `None` *(викл.)* | Поточне падіння за невідомого статусу батька |
-| `unobserved_candidate` | `None` *(викл.)* | Кандидат із дотестового інвентарю не зафіксований у логах CI для цього SHA |
+| `ambiguous_current` | `None` | Змішані результати (`pass` і `fail`) на поточному SHA |
+| `parent_mixed` | `None` | Поточний результат за неоднозначного (`mixed`) статусу батька |
+| `unknown_parent` | `None` | Поточне падіння за невідомого статусу батька |
+| `unobserved_candidate` | `None` | Кандидат із дотестового інвентарю відсутній у логах CI для цього SHA |
+
+> **Правило виключення та обліку кандидатів:** усі записи з `label = None` виключаються з бінарного навчання та оцінювання (`filter_valid_pairs`). Натомість тести з фактичного CI ground truth, яких не було в дотестовому переліку `get_candidate_tests()` (`in_candidate_inventory == False`), **не використовуються** під час навчання моделі (`train_lgbm`) і ізотонічної калібрування (`calibrate_isotonic`), отримують примусовий прогноз `0.0` і не можуть бути обрані селектором (`selected_mask = False`), але **враховуються як невиявлені в повному ground truth при конформному калібруванні та обчисленні CMR** (тобто не зникають із оцінювання).
 
 Для аналізу чутливості також підтримуються бінарні політики `--policy strict_all_fail` та `--policy any_fail`.
 
@@ -161,9 +163,10 @@
 | **CMR** | Change Miss Rate — частка дефектних комітів, де жоден обраний тест не впав (`95%` інтервали: Wilson score CI `cmr_ci_low/high` та moving block bootstrap CI `cmr_boot_ci_low/high`) |
 | **TTFF** | Time-To-First-Failure — модельний послідовний час до першого виявленого падіння (у секундах, без моделювання паралельних воркерів) |
 | **Conditional APFDc** (`conditional_apfdc` / `apfdc`) | `1 − Σ(C_i − t_i/2) / (m·T)` — cost-cognizant APFD, обчислений **по вибраній підмножині тестів** (`T` = сумарна тривалість лише обраних тестів для даного коміту, без кліпування `[0, 1]`) |
-| **Brier Score** (`brier_score_test`) | Середньоквадратична помилка каліброваних імовірностей |
-| **% Tests Selected** | Частка обраних тестів |
-| **% Duration Saved** | Заощаджений час виконання |
+| **PR-AUC / PR-AUC Baseline** (`pr_auc_test`, `pr_auc_baseline_test`) | Площа під PR-кривою та її базовий рівень (частка `label == 1` у `test_df`) |
+| **Brier Score (raw / iso / baseline)** (`brier_raw_test`, `brier_score_test`, `brier_baseline_test`) | Brier score сирих імовірностей LightGBM, після ізотонічної калібрування та константного прогнозу за часткою позитивів у `train` |
+| **% Tests Selected** | Частка обраних тестів (у межах доступних спостережень CI) |
+| **% Duration Saved** | Заощаджений час виконання (у межах доступних спостережень CI) |
 
 > **Важливо:** **TTFF** та **Conditional APFDc** є **умовними** метриками — вони обчислюються виключно на **виявлених** дефектних комітах, а знаменник `T` у `Conditional APFDc` береться по вибраному піднабору тестів (не по повному набору). Їх **завжди** слід інтерпретувати разом із **CMR** та бюджетом (`% Tests Selected` / `% Duration Saved`).
 
@@ -266,7 +269,7 @@ python src/run_experiment.py
 
 Результати автоматично зберігаються в унікальну папку `outputs/runs/<timestamp>_<tag>_seeds<N>/` (наприклад, `outputs/runs/2026-11-23_17-52_all5_seeds5/`):
 - `results_raw.csv` — один рядок на `(project, seed, alpha, method)`
-- `results_table.csv` — `mean ± std` агреговані по `(project, method, alpha)`, включно з `conditional_apfdc_mean`, `brier_score_test_mean`, `cmr_ci_low/high`, `cmr_boot_ci_low/high`
+- `results_table.csv` — `mean ± std` агреговані по `(project, method, alpha)`, включно з `conditional_apfdc_mean`, `pr_auc_baseline_test_mean`, `brier_score_test_mean`, `brier_raw_test_mean`, `brier_baseline_test_mean`, `cmr_ci_low/high`, `cmr_boot_ci_low/high`
 - `results_rolling.csv` — результати по ковзних вікнах (`--rolling`): логує як виконані вікна (`status="ok"`), так і пропущені (`status="skipped"`, `skip_reason`), а також `min_def_conf_nonzero` та `sufficient_for_nonzero_threshold` для кожного `alpha`
 - `figures/fig1_cmr_vs_alpha.{pdf,png}` — CMR vs α для всіх методів
 - `figures/fig2_budget_vs_alpha.{pdf,png}` — Частка обраних тестів vs α

@@ -1092,5 +1092,214 @@ class TestExperimentFiltering:
         assert min_defective_for_nonzero_threshold(0.20) == 4
 
 
+class TestAuditThirdRound:
+    """Third audit checks: candidate inventory vs full GT and baseline PR-AUC/Brier."""
+
+    def test_missing_candidate_failure_counted_as_miss(self, tmp_path: Path):
+        """
+        Scenario: on a defective commit, the ONLY failing test has
+        in_candidate_inventory == False.
+
+        Verify that:
+        1. No selector (even global_conformal at lambda=0.0 or residual_risk at tau=0.0
+           or top-k / random_matched / threshold_target_recall) can select it.
+        2. The commit is NOT dropped from conformal calibration or evaluation;
+           CMR for this commit == 1.0 (counted as miss).
+        3. Conformal score S_c and tau score correspond to impossibility of detection (0.0).
+        4. pct_tests_selected / pct_duration_saved are computed correctly, and
+           build_project_data unions candidate inventory with reveal_ground_truth.
+        """
+        from conformal import (
+            compute_conformal_scores,
+            compute_tau_residual,
+            select_tests_global,
+            select_tests_residual,
+        )
+        from evaluate import compare_all_methods
+        from run_experiment import build_project_data, filter_valid_pairs
+        from simulator import CIHistorySimulator
+
+        df = pd.DataFrame({
+            "commit_idx": [0, 0],
+            "testName": ["T_cand_pass", "T_missing_fail"],
+            "label": [0, 1],
+            "actual_duration": [10.0, 5.0],
+            "duration_median_20": [10.0, np.nan],
+            "fail_rate_20": [0.5, np.nan],
+            "last_fail_dist": [1, np.nan],
+            "in_candidate_inventory": [True, False],
+        })
+        # Even if raw array had non-zero prob on non-candidate, conformal/evaluate
+        # force 0.0 / False on in_candidate_inventory == False
+        probs = np.array([0.80, 0.99])
+
+        # 1. Conformal scores reflect impossibility of detecting non-candidate failure
+        scores = compute_conformal_scores(df, probs)
+        assert len(scores) == 1
+        assert scores[0] == pytest.approx(0.0)
+        assert compute_tau_residual(df, probs, alpha=0.10) == pytest.approx(0.0)
+
+        # 2. Neither global (threshold=0.0) nor residual (tau=0.0) may select T_missing_fail
+        sel_g = select_tests_global(df, np.array([0.80, 0.0]), threshold=0.0)
+        assert sel_g["testName"].tolist() == ["T_cand_pass"]
+        sel_r = select_tests_residual(df, np.array([0.80, 0.0]), tau=0.0)
+        assert sel_r["testName"].tolist() == ["T_cand_pass"]
+
+        # 3. Full evaluation preserves defective commit and assigns CMR == 1.0 to all selectors
+        rows = compare_all_methods(
+            df_test=df,
+            probs_test=np.array([0.80, 0.0]),
+            threshold_global=0.0,
+            tau_residual=0.0,
+            alpha=0.10,
+            df_val=df,
+            probs_val=np.array([0.80, 0.0]),
+        )
+        by_method = {r["method"]: r for r in rows}
+        for method, r in by_method.items():
+            assert r["n_defective_commits"] == 1
+            if method == "retest_all":
+                # Full-suite CI oracle catches all observed failures
+                assert r["cmr"] == pytest.approx(0.0)
+                assert r["pct_tests_selected"] == pytest.approx(1.0)
+                assert r["pct_duration_saved"] == pytest.approx(0.0)
+            else:
+                assert r["cmr"] == pytest.approx(1.0), f"{method} must miss non-candidate fail"
+                if method == "global_conformal":
+                    assert r["n_selected"] == 1
+                    assert r["pct_tests_selected"] == pytest.approx(0.5)
+                    assert r["pct_duration_saved"] == pytest.approx(5.0 / 15.0)
+
+        # 4. End-to-end build_project_data integration with an explicit manifest omitting T_missing_fail
+        project = "inv_union_proj"
+        _setup_rtp_project(
+            tmp_path,
+            project,
+            job_sha_rows=[(1, "A"), (2, "B")],
+            patch_rows=[("A", "App.java"), ("B", "App.java")],
+            run_rows=[
+                (1, "T_cand_pass", 10.0, 0, 0),
+                (1, "T_missing_fail", 5.0, 0, 0),
+                (2, "T_cand_pass", 10.0, 0, 0),
+                (2, "T_missing_fail", 5.0, 1, 0),
+            ],
+        )
+        sim = CIHistorySimulator(
+            tmp_path,
+            project,
+            test_inventory={"A": ["T_cand_pass"], "B": ["T_cand_pass"]},
+        )
+        df_raw = build_project_data(sim, policy="confirmed_new_fail")
+        row_b_miss = df_raw[(df_raw["commit"] == "B") & (df_raw["testName"] == "T_missing_fail")]
+        assert len(row_b_miss) == 1
+        assert bool(row_b_miss["in_candidate_inventory"].iloc[0]) is False
+        assert row_b_miss["label"].iloc[0] == 1
+
+        df_clean, _ = filter_valid_pairs(
+            df_raw, include_fallback_parents=True, policy="confirmed_new_fail", verbose=False
+        )
+        row_b_clean = df_clean[(df_clean["commit"] == "B") & (df_clean["testName"] == "T_missing_fail")]
+        assert len(row_b_clean) == 1
+        assert bool(row_b_clean["in_candidate_inventory"].iloc[0]) is False
+        assert row_b_clean["label"].iloc[0] == 1
+
+    def test_pr_auc_and_brier_baselines(self, tmp_path: Path):
+        """
+        Verify compute_pr_auc_baseline, compute_brier_baseline, and end-to-end
+        run_one + aggregate_results reporting of pr_auc_baseline_test,
+        brier_baseline_test, brier_raw_test, and brier_score_test.
+        """
+        from features import FEATURE_COLS
+        from models import compute_brier_baseline, compute_brier_score, compute_pr_auc_baseline
+        from run_experiment import aggregate_results, run_one
+        from simulator import CIHistorySimulator
+
+        # Direct formula checks
+        y_train = np.array([1, 0, 0, 0])  # prior = 0.25
+        y_test = np.array([1, 0, 1, 0])   # prevalence = 0.50
+        assert compute_pr_auc_baseline(y_test) == pytest.approx(0.50)
+        # Brier of predicting 0.25 on [1, 0, 1, 0] = mean([0.5625, 0.0625, 0.5625, 0.0625]) = 0.3125
+        assert compute_brier_baseline(y_train, y_test) == pytest.approx(0.3125)
+        assert compute_brier_baseline(y_train, y_test) == pytest.approx(
+            compute_brier_score(y_test, np.full(4, 0.25))
+        )
+        assert np.isnan(compute_pr_auc_baseline(np.array([])))
+        assert np.isnan(compute_brier_baseline(np.array([]), y_test))
+
+        # End-to-end run_one check with synthetic project DataFrame (80 commits, 3 tests/commit,
+        # including an unselectable non-candidate row with NaN features)
+        project = "brier_e2e_proj"
+        _setup_rtp_project(
+            tmp_path,
+            project,
+            job_sha_rows=[(1, "S0")],
+            patch_rows=[("S0", "App.java")],
+            run_rows=[(1, "t_cand_0", 1.0, 0, 0)],
+        )
+        sim = CIHistorySimulator(tmp_path, project)
+
+        rng = np.random.default_rng(123)
+        records = []
+        for cid in range(80):
+            # 2 candidate tests per commit (signal in fail_rate_5)
+            for ti in range(2):
+                lbl = 1 if (ti == 0 and cid % 2 == 0) else 0
+                rec = {
+                    "commit": f"c_{cid}",
+                    "commit_idx": cid,
+                    "testName": f"t_cand_{ti}",
+                    "label": lbl,
+                    "actual_duration": 2.0 + ti,
+                    "in_candidate_inventory": True,
+                }
+                for col in FEATURE_COLS:
+                    rec[col] = float(rng.normal(loc=2.0 if lbl == 1 else 0.0, scale=0.5))
+                records.append(rec)
+
+            # 1 non-candidate test with NaN features; fails only on odd test commit 79
+            noncand_rec = {
+                "commit": f"c_{cid}",
+                "commit_idx": cid,
+                "testName": "t_noncand",
+                "label": 1 if cid == 79 else 0,
+                "actual_duration": 3.0,
+                "in_candidate_inventory": False,
+            }
+            for col in FEATURE_COLS:
+                noncand_rec[col] = np.nan
+            records.append(noncand_rec)
+
+        df_synth = pd.DataFrame(records)
+        rows = run_one(sim, df_synth, seed=0)
+        assert len(rows) > 0
+        for r in rows:
+            for col in (
+                "pr_auc_test",
+                "pr_auc_baseline_test",
+                "brier_score_test",
+                "brier_raw_test",
+                "brier_baseline_test",
+            ):
+                assert col in r
+                assert np.isfinite(r[col]), f"{col} should be finite"
+            assert 0.0 <= r["pr_auc_baseline_test"] <= 1.0
+            # Test split has 9 defective commits (8 from t_cand_0 + commit 79 from t_noncand)
+            assert r["n_def_test"] == 9
+            if r["method"] == "global_conformal":
+                assert r["cmr"] >= 1.0 / 9.0
+            elif r["method"] == "retest_all":
+                assert r["cmr"] == pytest.approx(0.0)
+
+        table = aggregate_results(rows)
+        for col in (
+            "pr_auc_baseline_test_mean",
+            "brier_raw_test_mean",
+            "brier_baseline_test_mean",
+            "brier_score_test_mean",
+        ):
+            assert col in table.columns
+            assert table[col].notna().all()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
