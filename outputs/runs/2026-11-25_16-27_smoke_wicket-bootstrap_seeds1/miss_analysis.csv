@@ -1,0 +1,2 @@
+commit,commit_idx,miss_cause,n_selected_commit,n_total_cand_commit,n_cand_fail,n_noncand_fail,max_cand_fail_prob,best_cand_fail_rank,has_history_on_cand_fail,project,seed,alpha,method,selected_calibrator
+feba70872f3e98cd85d838b051c9e0bf0029633f,718,empty_prefix,0,41,29,0,0.1416490486257928,1,True,l0rdn1kk0n@wicket-bootstrap,0,0.2,residual_risk,isotonic

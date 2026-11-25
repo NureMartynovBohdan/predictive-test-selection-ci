@@ -1,0 +1,40 @@
+{
+  "run_id": "2026-11-25_16-27_smoke_wicket-bootstrap_seeds1",
+  "timestamp": "2026-11-25T16:29:32",
+  "git_commit": "d680d4e",
+  "config_hash": "1261f9a2eecb",
+  "dataset_root": "C:\\Users\\Bogdan\\Desktop\\\u0412\u0423\u0417\\data maga\\Code\\rtp-torrent",
+  "completed_projects": [
+    "l0rdn1kk0n@wicket-bootstrap"
+  ],
+  "config": {
+    "projects": [
+      "l0rdn1kk0n@wicket-bootstrap"
+    ],
+    "alphas": [
+      0.05,
+      0.1,
+      0.15,
+      0.2
+    ],
+    "seeds": 1,
+    "policy": "confirmed_new_fail",
+    "calibration_method": "auto",
+    "include_fallback_parents": false,
+    "rolling": true,
+    "rolling_splits": 3,
+    "strict_min_defective": 0,
+    "holdout_split": {
+      "train": 0.5,
+      "prob_calib": 0.15,
+      "conf_calib": 0.15,
+      "test": 0.2
+    },
+    "rolling_split": {
+      "min_train_frac": 0.25,
+      "prob_calib": 0.15,
+      "conf_calib": 0.15,
+      "test": 0.15
+    }
+  }
+}

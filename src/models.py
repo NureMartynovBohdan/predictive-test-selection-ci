@@ -15,11 +15,12 @@ Random seeds are supported for multi-seed experiments (10–30 runs).
 from __future__ import annotations
 
 import warnings
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -198,8 +199,48 @@ def train_lgbm(
 
 
 # ---------------------------------------------------------------------------
-# Isotonic calibration
+# Probability calibration (Isotonic vs Platt / Sigmoid) & ProbCalib selection
 # ---------------------------------------------------------------------------
+
+class PlattCalibrator:
+    """Platt scaling: 1D logistic regression on clipped raw log-odds.
+
+    Especially effective when base gradient-boosted trees are trained with
+    ``scale_pos_weight``, which shifts raw margins upward while keeping rank
+    ordering informative.
+    """
+
+    def __init__(self, eps: float = 1e-6, C: float = 1.0):
+        self.eps = float(eps)
+        self.C = float(C)
+        self._lr = LogisticRegression(C=self.C, solver="lbfgs")
+        self._const_prob: Optional[float] = None
+
+    def _to_logit(self, raw_probs: np.ndarray) -> np.ndarray:
+        p = np.clip(np.asarray(raw_probs, dtype=float), self.eps, 1.0 - self.eps)
+        return np.log(p / (1.0 - p)).reshape(-1, 1)
+
+    def fit(self, raw_probs: np.ndarray, y: np.ndarray) -> "PlattCalibrator":
+        """Fit logistic map logit(raw_probs) -> P(y=1)."""
+        y_arr = np.asarray(y, dtype=int)
+        if len(y_arr) == 0:
+            raise ValueError("Cannot fit PlattCalibrator on empty data")
+        if np.unique(y_arr).size < 2:
+            self._const_prob = float(np.mean(y_arr == 1))
+            return self
+        self._const_prob = None
+        self._lr.fit(self._to_logit(raw_probs), y_arr)
+        return self
+
+    def predict(self, raw_probs: np.ndarray) -> np.ndarray:
+        """Predict calibrated probabilities from 1D raw model probabilities."""
+        raw_arr = np.asarray(raw_probs, dtype=float)
+        if len(raw_arr) == 0:
+            return np.array([], dtype=float)
+        if self._const_prob is not None:
+            return np.full(len(raw_arr), self._const_prob, dtype=float)
+        return np.asarray(self._lr.predict_proba(self._to_logit(raw_arr))[:, 1], dtype=float)
+
 
 def calibrate_isotonic(
     model,
@@ -217,9 +258,106 @@ def calibrate_isotonic(
     return iso
 
 
+def calibrate_sigmoid(
+    model,
+    calib: pd.DataFrame,
+    feature_cols: List[str],
+    eps: float = 1e-6,
+    C: float = 1.0,
+) -> PlattCalibrator:
+    """Fit Platt (sigmoid) calibration strictly on ``in_candidate_inventory == True`` rows."""
+    calib_use = _filter_candidate_inventory(calib)
+    X_cal = calib_use[feature_cols]  # NO fillna
+    y_cal = calib_use["label"]
+
+    raw_probs = model.predict_proba(X_cal)[:, 1]
+    return PlattCalibrator(eps=eps, C=C).fit(raw_probs, y_cal)
+
+
+def evaluate_and_select_calibrators(
+    model,
+    prob_calib: pd.DataFrame,
+    feature_cols: List[str],
+    train_prior: float,
+    n_splits: int = 3,
+) -> Dict[str, Any]:
+    """Fit both Isotonic and Platt/Sigmoid calibrators on ``ProbCalib`` candidates
+    and compare them via deterministic commit-grouped out-of-fold CV on ``ProbCalib``
+    alone (zero leakage from ``ConfCalib`` or ``Test``).
+    """
+    calib_use = _filter_candidate_inventory(prob_calib)
+    X_cal = calib_use[feature_cols]  # NO fillna
+    y_cal = np.asarray(calib_use["label"].astype(int).values, dtype=int)
+    raw_probs = np.asarray(model.predict_proba(X_cal)[:, 1], dtype=float)
+
+    iso_full = IsotonicRegression(out_of_bounds="clip").fit(raw_probs, y_cal)
+    sig_full = PlattCalibrator().fit(raw_probs, y_cal)
+
+    commits = (
+        np.asarray(calib_use["commit_idx"].values)
+        if "commit_idx" in calib_use.columns
+        else np.arange(len(calib_use))
+    )
+    unique_c = np.sort(np.unique(commits))
+    pos_commits = [cid for cid in unique_c if (y_cal[commits == cid] == 1).any()]
+    neg_commits = [cid for cid in unique_c if not (y_cal[commits == cid] == 1).any()]
+    n_pos_commits = len(pos_commits)
+
+    k_eff = min(int(n_splits), n_pos_commits)
+    cv_brier_base = compute_brier_score(y_cal, np.full(len(y_cal), float(train_prior), dtype=float))
+    cv_brier_iso = float("nan")
+    cv_brier_sig = float("nan")
+    cv_bss_iso = float("nan")
+    cv_bss_sig = float("nan")
+    selected_name = "sigmoid"
+
+    if k_eff >= 2 and len(unique_c) >= k_eff:
+        fold_map: Dict[Any, int] = {}
+        for idx, cid in enumerate(pos_commits):
+            fold_map[cid] = idx % k_eff
+        for idx, cid in enumerate(neg_commits):
+            fold_map[cid] = idx % k_eff
+        fold_ids = np.array([fold_map[cid] for cid in commits], dtype=int)
+
+        oof_iso = np.full(len(y_cal), np.nan, dtype=float)
+        oof_sig = np.full(len(y_cal), np.nan, dtype=float)
+        valid_cv = True
+
+        for f in range(k_eff):
+            val_mask = fold_ids == f
+            tr_mask = ~val_mask
+            if not tr_mask.any() or not val_mask.any() or np.unique(y_cal[tr_mask]).size < 2:
+                valid_cv = False
+                break
+            iso_f = IsotonicRegression(out_of_bounds="clip").fit(raw_probs[tr_mask], y_cal[tr_mask])
+            sig_f = PlattCalibrator().fit(raw_probs[tr_mask], y_cal[tr_mask])
+            oof_iso[val_mask] = iso_f.predict(raw_probs[val_mask])
+            oof_sig[val_mask] = sig_f.predict(raw_probs[val_mask])
+
+        if valid_cv and not (np.isnan(oof_iso).any() or np.isnan(oof_sig).any()):
+            cv_brier_iso = compute_brier_score(y_cal, oof_iso)
+            cv_brier_sig = compute_brier_score(y_cal, oof_sig)
+            cv_bss_iso = compute_brier_skill_score(cv_brier_iso, cv_brier_base)
+            cv_bss_sig = compute_brier_skill_score(cv_brier_sig, cv_brier_base)
+            selected_name = "sigmoid" if cv_brier_sig <= cv_brier_iso else "isotonic"
+
+    return {
+        "iso": iso_full,
+        "sigmoid": sig_full,
+        "selected_name": selected_name,
+        "selected_calibrator": sig_full if selected_name == "sigmoid" else iso_full,
+        "prob_cv_brier_iso": cv_brier_iso,
+        "prob_cv_brier_sigmoid": cv_brier_sig,
+        "prob_cv_brier_baseline": cv_brier_base,
+        "prob_cv_bss_iso": cv_bss_iso,
+        "prob_cv_bss_sigmoid": cv_bss_sig,
+        "n_pos_commits_prob": int(n_pos_commits),
+    }
+
+
 def predict_raw_and_calibrated(
     model,
-    iso: IsotonicRegression,
+    calibrator,
     df: pd.DataFrame,
     feature_cols: List[str],
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -229,18 +367,18 @@ def predict_raw_and_calibrated(
         return empty, empty
     X = df[feature_cols]  # NO fillna
     raw = np.asarray(model.predict_proba(X)[:, 1], dtype=float)
-    cal = np.asarray(iso.predict(raw), dtype=float)
+    cal = np.asarray(calibrator.predict(raw), dtype=float)
     return raw, cal
 
 
 def predict_calibrated(
     model,
-    iso: IsotonicRegression,
+    calibrator,
     df: pd.DataFrame,
     feature_cols: List[str],
 ) -> np.ndarray:
     """Return calibrated probabilities for all rows in df."""
-    _, cal = predict_raw_and_calibrated(model, iso, df, feature_cols)
+    _, cal = predict_raw_and_calibrated(model, calibrator, df, feature_cols)
     return cal
 
 
@@ -290,3 +428,16 @@ def compute_brier_baseline(train_labels: np.ndarray, test_labels: np.ndarray) ->
     prior = float(np.mean(tr == 1))
     const_preds = np.full(te.shape, prior, dtype=float)
     return compute_brier_score(te, const_preds)
+
+
+def compute_brier_skill_score(brier_model: float, brier_baseline: float) -> float:
+    """Brier Skill Score: ``BSS = 1 - BS_model / BS_baseline``.
+
+    ``BSS > 0`` improves over constant prevalence, ``0`` matches baseline,
+    and ``< 0`` is worse than constant baseline.
+    """
+    bm = float(brier_model)
+    bb = float(brier_baseline)
+    if not np.isfinite(bm) or not np.isfinite(bb) or bb <= 0.0:
+        return float("nan")
+    return float(1.0 - (bm / bb))

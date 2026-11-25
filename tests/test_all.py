@@ -1158,8 +1158,8 @@ class TestAuditThirdRound:
         by_method = {r["method"]: r for r in rows}
         for method, r in by_method.items():
             assert r["n_defective_commits"] == 1
-            if method == "retest_all":
-                # Full-suite CI oracle catches all observed failures
+            if method in {"retest_all", "qtf", "latest_fail_cc"}:
+                # Full-suite CI / TCP baselines run all observed failures (different orderings)
                 assert r["cmr"] == pytest.approx(0.0)
                 assert r["pct_tests_selected"] == pytest.approx(1.0)
                 assert r["pct_duration_saved"] == pytest.approx(0.0)
@@ -1283,6 +1283,11 @@ class TestAuditThirdRound:
                 assert col in r
                 assert np.isfinite(r[col]), f"{col} should be finite"
             assert 0.0 <= r["pr_auc_baseline_test"] <= 1.0
+            # ML metrics are evaluated strictly on in_candidate_inventory == True:
+            # 8 positive candidates out of 32 test candidates = 0.25 (not 9/48 = 0.1875)
+            assert r["pr_auc_baseline_test"] == pytest.approx(0.25)
+            assert r["n_inv_miss_only_defective_commits"] == 1
+            assert r["inv_miss_commit_rate_test"] == pytest.approx(1.0 / 9.0)
             # Test split has 9 defective commits (8 from t_cand_0 + commit 79 from t_noncand)
             assert r["n_def_test"] == 9
             if r["method"] == "global_conformal":
@@ -1296,9 +1301,319 @@ class TestAuditThirdRound:
             "brier_raw_test_mean",
             "brier_baseline_test_mean",
             "brier_score_test_mean",
+            "cmr_exact_ci_high_mean",
+            "cmr_upper_95_mean",
         ):
             assert col in table.columns
             assert table[col].notna().all()
+
+
+class TestAuditFourthRoundP0:
+    """Fourth audit P0 checks: exact binomial CIs, pooled rolling CMR, manifest, split guard."""
+
+    def test_exact_binomial_ci_and_one_sided_bound(self):
+        from evaluate import compute_exact_binomial_ci_counts, evaluate_selection
+
+        # 0 misses in 11 commits: exact one-sided 95% upper bound = 1 - 0.05^(1/11) ~= 0.2384
+        cmr, lo, hi, up95 = compute_exact_binomial_ci_counts(n_missed=0, n_defective=11)
+        assert cmr == pytest.approx(0.0)
+        assert lo == pytest.approx(0.0)
+        assert up95 == pytest.approx(1.0 - 0.05 ** (1.0 / 11.0))
+        assert 0.28 < hi < 0.29  # Clopper-Pearson two-sided upper 95% bound ~= 0.2849
+
+        # 59 commits with 0 misses achieves U_95 < 0.05
+        _, _, _, up95_59 = compute_exact_binomial_ci_counts(n_missed=0, n_defective=59)
+        assert up95_59 < 0.05
+
+        df = pd.DataFrame({
+            "commit_idx": list(range(11)),
+            "testName": [f"t{i}" for i in range(11)],
+            "label": [1] * 11,
+            "actual_duration": [5.0] * 11,
+            "_prob": [0.9] * 11,
+        })
+        res = evaluate_selection(df, np.ones(11, dtype=bool), "global_conformal", alpha=0.05)
+        assert res["n_defective_commits"] == 11
+        assert res["n_missed_defective_commits"] == 0
+        assert res["cmr_exact_ci_low"] == pytest.approx(0.0)
+        assert res["cmr_upper_95"] == pytest.approx(1.0 - 0.05 ** (1.0 / 11.0))
+
+    def test_pooled_rolling_cmr_and_manifest(self, tmp_path: Path):
+        import json
+        from run_experiment import aggregate_rolling_results, write_run_manifest
+
+        rolling_df = pd.DataFrame([
+            {
+                "project": "p1", "seed": 0, "window": 0, "method": "global_conformal",
+                "alpha": 0.10, "status": "ok", "sufficient_for_nonzero_threshold": True,
+                "n_def_test": 20, "n_missed_test": 0, "cmr": 0.0,
+                "pct_tests_selected": 0.4, "pct_duration_saved": 0.6,
+            },
+            {
+                "project": "p1", "seed": 0, "window": 1, "method": "global_conformal",
+                "alpha": 0.10, "status": "ok", "sufficient_for_nonzero_threshold": True,
+                "n_def_test": 20, "n_missed_test": 1, "cmr": 0.05,
+                "pct_tests_selected": 0.4, "pct_duration_saved": 0.6,
+            },
+            {
+                "project": "p1", "seed": 0, "window": 2, "method": "global_conformal",
+                "alpha": 0.10, "status": "ok", "sufficient_for_nonzero_threshold": False,
+                "n_def_test": 5, "n_missed_test": 2, "cmr": 0.40,
+                "pct_tests_selected": 0.3, "pct_duration_saved": 0.7,
+            },
+            {
+                "project": "p1", "seed": 0, "window": 3, "method": "global_conformal",
+                "alpha": 0.10, "status": "skipped", "sufficient_for_nonzero_threshold": False,
+                "n_def_test": 2, "n_missed_test": 0, "cmr": np.nan,
+                "pct_tests_selected": np.nan, "pct_duration_saved": np.nan,
+            },
+        ])
+        pooled = aggregate_rolling_results(rolling_df)
+        assert len(pooled) == 1
+        row = pooled.iloc[0]
+        # Pooled CMR weights by commits: (0 + 1 + 2) / (20 + 20 + 5) = 3/45, NOT unweighted mean 0.15
+        assert row["pooled_n_def_test"] == 45
+        assert row["pooled_n_missed_test"] == 3
+        assert row["pooled_cmr"] == pytest.approx(3.0 / 45.0)
+        assert row["mean_window_cmr"] == pytest.approx(0.15)
+        assert row["n_windows_insufficient_threshold"] == 1
+        assert row["pooled_cmr_exact_ci_low"] < row["pooled_cmr"] < row["pooled_cmr_exact_ci_high"]
+
+        mpath = write_run_manifest(
+            run_dir=tmp_path,
+            run_id="test_run_id",
+            target_projects=["p1"],
+            num_seeds=1,
+            policy="confirmed_new_fail",
+            include_fallback_parents=False,
+            rolling=True,
+            rolling_splits=3,
+            strict_min_defective=0,
+            completed_projects=["p1"],
+        )
+        data = json.loads(mpath.read_text(encoding="utf-8"))
+        assert data["run_id"] == "test_run_id"
+        assert data["completed_projects"] == ["p1"]
+        assert "config_hash" in data and len(data["config_hash"]) == 12
+
+    def test_single_class_candidate_split_rejected_cleanly(self, tmp_path: Path):
+        from run_experiment import _validate_candidate_training_splits, run_rolling
+        from simulator import CIHistorySimulator
+
+        df_single = pd.DataFrame({
+            "commit_idx": [0, 1],
+            "testName": ["t1", "t1"],
+            "label": [0, 0],
+            "in_candidate_inventory": [True, True],
+        })
+        df_both = pd.DataFrame({
+            "commit_idx": [0, 1],
+            "testName": ["t1", "t1"],
+            "label": [0, 1],
+            "in_candidate_inventory": [True, True],
+        })
+        ok1, r1 = _validate_candidate_training_splits(df_single, df_both)
+        assert ok1 is False and "train_cand" in r1
+        ok2, r2 = _validate_candidate_training_splits(df_both, df_single)
+        assert ok2 is False and "prob_cand" in r2
+
+        # Rolling window where candidate training has only 0s (only non-candidate failed in train)
+        project = "single_cls_proj"
+        _setup_rtp_project(
+            tmp_path,
+            project,
+            job_sha_rows=[(1, "S0")],
+            patch_rows=[("S0", "App.java")],
+            run_rows=[(1, "t1", 1.0, 0, 0)],
+        )
+        sim = CIHistorySimulator(tmp_path, project)
+
+        recs = []
+        for cid in range(40):
+            # Candidates fail ONLY after cid >= 20 (so train window [0..9] has only label=0 candidates!)
+            recs.append({
+                "commit": f"c_{cid}",
+                "commit_idx": cid,
+                "testName": "t_cand",
+                "label": 1 if cid >= 20 else 0,
+                "actual_duration": 1.0,
+                "in_candidate_inventory": True,
+            })
+        df_roll = pd.DataFrame(recs)
+        rrows = run_rolling(sim, df_roll, seed=0, n_splits=2)
+        assert len(rrows) > 0
+        win0 = [r for r in rrows if r["window"] == 0]
+        assert all(r["status"] == "skipped" for r in win0)
+        assert any("train_cand_single_class" in r["skip_reason"] for r in win0)
+
+
+class TestP1P2Extensions:
+    """P1 & P2 verification: Platt vs Isotonic calibration, BSS, duration-weighted savings,
+    miss-cause taxonomy, QTF & LatestFail+CC orderings, TTFF median/p90, and BEST_PROJECTS."""
+
+    def test_best_projects_list_and_brier_skill_score(self):
+        from models import compute_brier_skill_score
+        from run_experiment import BEST_PROJECTS
+
+        assert BEST_PROJECTS == [
+            "apache@sling",
+            "l0rdn1kk0n@wicket-bootstrap",
+            "SonarSource@sonarqube",
+            "deeplearning4j@deeplearning4j",
+        ]
+        assert compute_brier_skill_score(0.01, 0.04) == pytest.approx(0.75)
+        assert compute_brier_skill_score(0.04, 0.04) == pytest.approx(0.0)
+        assert compute_brier_skill_score(0.06, 0.04) == pytest.approx(-0.5)
+        assert np.isnan(compute_brier_skill_score(0.01, 0.0))
+        assert np.isnan(compute_brier_skill_score(float("nan"), 0.04))
+
+    def test_platt_calibrator_and_prob_calib_cv_selection(self):
+        from features import FEATURE_COLS
+        from models import PlattCalibrator, evaluate_and_select_calibrators, train_lgbm
+
+        rng = np.random.default_rng(7)
+        rows = []
+        for cid in range(60):
+            for tid in range(4):
+                lbl = 1 if (tid == 0 and cid % 4 == 0) else 0
+                rec = {
+                    "commit_idx": cid,
+                    "testName": f"t_{tid}",
+                    "label": lbl,
+                    "in_candidate_inventory": True,
+                }
+                for col in FEATURE_COLS:
+                    rec[col] = float(rng.normal(loc=2.5 if lbl == 1 else 0.0, scale=0.6))
+                rows.append(rec)
+        df = pd.DataFrame(rows)
+        train_df = df[df["commit_idx"] < 30].copy()
+        prob_df = df[df["commit_idx"] >= 30].copy()
+
+        model = train_lgbm(train_df, FEATURE_COLS, seed=0, n_estimators=30)
+        platt = PlattCalibrator().fit(model.predict_proba(prob_df[FEATURE_COLS])[:, 1], prob_df["label"].values)
+        p_sig = platt.predict(model.predict_proba(prob_df[FEATURE_COLS])[:, 1])
+        assert p_sig.shape == (len(prob_df),)
+        assert np.all((p_sig > 0.0) & (p_sig < 1.0))
+
+        cal_info = evaluate_and_select_calibrators(
+            model, prob_df, FEATURE_COLS, train_prior=float(train_df["label"].mean()), n_splits=3
+        )
+        assert cal_info["selected_name"] in {"isotonic", "sigmoid"}
+        assert np.isfinite(cal_info["prob_cv_brier_iso"])
+        assert np.isfinite(cal_info["prob_cv_brier_sigmoid"])
+        expected_winner = (
+            "sigmoid"
+            if cal_info["prob_cv_brier_sigmoid"] <= cal_info["prob_cv_brier_iso"]
+            else "isotonic"
+        )
+        assert cal_info["selected_name"] == expected_winner
+
+    def test_qtf_latest_fail_cc_and_ttff_quantiles(self):
+        from evaluate import compare_all_methods, evaluate_selection
+
+        # Two defective commits so median and p90 differ cleanly
+        df = pd.DataFrame([
+            # Commit 0: fast failing test t_fast (dur=1s), slow passing t_slow (dur=100s)
+            {
+                "commit": "c0", "commit_idx": 0, "testName": "t_slow", "label": 0,
+                "actual_duration": 100.0, "duration_median_20": 100.0,
+                "last_fail_dist": np.nan, "test_file_changed": 0, "same_package_changed": 0,
+                "in_candidate_inventory": True, "_prob": 0.6,
+            },
+            {
+                "commit": "c0", "commit_idx": 0, "testName": "t_fast", "label": 1,
+                "actual_duration": 1.0, "duration_median_20": 1.0,
+                "last_fail_dist": np.nan, "test_file_changed": 1, "same_package_changed": 1,
+                "in_candidate_inventory": True, "_prob": 0.4,
+            },
+            # Commit 1: fast passing (dur=2s), medium failing (dur=20s) with coupling
+            {
+                "commit": "c1", "commit_idx": 1, "testName": "t_fast_p", "label": 0,
+                "actual_duration": 2.0, "duration_median_20": 2.0,
+                "last_fail_dist": np.nan, "test_file_changed": 0, "same_package_changed": 0,
+                "in_candidate_inventory": True, "_prob": 0.7,
+            },
+            {
+                "commit": "c1", "commit_idx": 1, "testName": "t_med_fail", "label": 1,
+                "actual_duration": 20.0, "duration_median_20": 20.0,
+                "last_fail_dist": 2.0, "test_file_changed": 1, "same_package_changed": 0,
+                "in_candidate_inventory": True, "_prob": 0.5,
+            },
+        ])
+        mask_all = np.ones(len(df), dtype=bool)
+        res_qtf = evaluate_selection(df, mask_all, "qtf", alpha=0.10, order_by="qtf")
+        # Commit 0 QTF runs t_fast (1s) first -> TTFF=1.0; Commit 1 runs t_fast_p (2s) then t_med_fail (20s) -> TTFF=22.0
+        assert res_qtf["ttff"] == pytest.approx(11.5)
+        assert res_qtf["ttff_median"] == pytest.approx(11.5)
+        assert res_qtf["ttff_p90"] == pytest.approx(np.percentile([1.0, 22.0], 90))
+
+        res_lfcc = evaluate_selection(df, mask_all, "latest_fail_cc", alpha=0.10, order_by="latest_fail_cc")
+        # Commit 0 ties on last_fail_dist=NaN, but test_file_changed=1 puts t_fast first -> TTFF=1.0
+        # Commit 1 last_fail_dist=2 puts t_med_fail first -> TTFF=20.0
+        assert res_lfcc["ttff"] == pytest.approx(10.5)
+
+        all_res = compare_all_methods(df, df["_prob"].values, threshold_global=0.5, tau_residual=0.5, alpha=0.10)
+        method_names = {r["method"] for r in all_res}
+        assert {"qtf", "latest_fail_cc", "global_conformal_qtf"}.issubset(method_names)
+
+    def test_miss_cause_breakdown_and_duration_weighted_savings(self):
+        from evaluate import analyze_miss_causes
+        from run_experiment import build_savings_summary
+
+        df = pd.DataFrame([
+            # Commit 0: missing_from_inventory
+            {"commit": "c0", "commit_idx": 0, "testName": "t0", "label": 0, "in_candidate_inventory": True, "run_count_total": 5},
+            {"commit": "c0", "commit_idx": 0, "testName": "t0_noncand", "label": 1, "in_candidate_inventory": False, "run_count_total": np.nan},
+            # Commit 1: empty_prefix (cand failure exists, 0 tests selected)
+            {"commit": "c1", "commit_idx": 1, "testName": "t1", "label": 1, "in_candidate_inventory": True, "run_count_total": 5},
+            # Commit 2: no_prior_history_low_score (other test selected, failing cand has run_count_total==0)
+            {"commit": "c2", "commit_idx": 2, "testName": "t2_sel", "label": 0, "in_candidate_inventory": True, "run_count_total": 10},
+            {"commit": "c2", "commit_idx": 2, "testName": "t2_fail_new", "label": 1, "in_candidate_inventory": True, "run_count_total": 0},
+            # Commit 3: score_below_cutoff (other test selected, failing cand has history run_count_total==8)
+            {"commit": "c3", "commit_idx": 3, "testName": "t3_sel", "label": 0, "in_candidate_inventory": True, "run_count_total": 10},
+            {"commit": "c3", "commit_idx": 3, "testName": "t3_fail_hist", "label": 1, "in_candidate_inventory": True, "run_count_total": 8},
+        ])
+        sel_mask = np.array([True, False, False, True, False, True, False], dtype=bool)
+        probs = np.array([0.8, 0.0, 0.1, 0.9, 0.05, 0.9, 0.2], dtype=float)
+        counts, recs = analyze_miss_causes(df, sel_mask, probs_test=probs)
+        assert counts["miss_missing_from_inventory"] == 1
+        assert counts["miss_empty_prefix"] == 1
+        assert counts["miss_no_prior_history"] == 1
+        assert counts["miss_score_below_cutoff"] == 1
+        assert counts["miss_total"] == 4
+        assert [r["miss_cause"] for r in recs] == [
+            "missing_from_inventory",
+            "empty_prefix",
+            "no_prior_history_low_score",
+            "score_below_cutoff",
+        ]
+
+        # Duration-weighted savings test: P1 has total=900s (sel=90s -> 90% saved), P2 has total=100s (sel=100s -> 0% saved)
+        raw_df = pd.DataFrame([
+            {
+                "project": "p1", "seed": 0, "method": "global_conformal", "alpha": 0.10,
+                "guarantee_type": "conformal_marginal_guarantee",
+                "pct_tests_selected": 0.10, "pct_duration_saved": 0.90, "cmr": 0.0,
+                "total_test_duration": 900.0, "selected_test_duration": 90.0,
+                "n_obs_pairs": 90, "n_selected_obs_pairs": 9,
+                "n_defective_commits": 10, "n_missed_defective_commits": 0,
+            },
+            {
+                "project": "p2", "seed": 0, "method": "global_conformal", "alpha": 0.10,
+                "guarantee_type": "conformal_marginal_guarantee",
+                "pct_tests_selected": 1.00, "pct_duration_saved": 0.00, "cmr": 0.0,
+                "total_test_duration": 100.0, "selected_test_duration": 100.0,
+                "n_obs_pairs": 10, "n_selected_obs_pairs": 10,
+                "n_defective_commits": 10, "n_missed_defective_commits": 0,
+            },
+        ])
+        sav = build_savings_summary(raw_df)
+        macro = sav[sav["row_type"] == "macro_mean_across_projects"].iloc[0]
+        dw = sav[sav["row_type"] == "duration_weighted_overall"].iloc[0]
+        assert macro["pct_duration_saved"] == pytest.approx(0.45)
+        # Duration-weighted: 1 - (90 + 100) / (900 + 100) = 0.81
+        assert dw["pct_duration_saved"] == pytest.approx(0.81)
+        assert dw["pct_tests_selected"] == pytest.approx(19.0 / 100.0)
 
 
 if __name__ == "__main__":

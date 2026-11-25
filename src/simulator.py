@@ -548,6 +548,12 @@ class CIHistorySimulator:
         for r in runs:
             by_test.setdefault(r.test_name, []).append(r)
 
+        parent_by_test: Dict[str, List[TestRun]] = {}
+        if parent_sha is not None:
+            for r in self._runs_by_commit.get(parent_sha, []):
+                if r.job_order < as_of_order:
+                    parent_by_test.setdefault(r.test_name, []).append(r)
+
         results: Dict[str, TestResult] = {}
         p_source = self._parent_source.get(commit_sha, "none")
 
@@ -571,10 +577,7 @@ class CIHistorySimulator:
             if parent_sha is None:
                 p_status_str = "unknown"
             else:
-                parent_runs_all = [
-                    r for r in self._runs_by_commit.get(parent_sha, [])
-                    if r.test_name == test_name and r.job_order < as_of_order
-                ]
+                parent_runs_all = parent_by_test.get(test_name)
                 if not parent_runs_all:
                     p_status_str = "unknown"
                 else:

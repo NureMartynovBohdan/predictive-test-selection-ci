@@ -117,6 +117,82 @@ def _commit_miss_indicators(
     return indicators
 
 
+def compute_exact_binomial_ci_counts(
+    n_missed: int,
+    n_defective: int,
+    confidence: float = 0.95,
+) -> Tuple[float, float, float, float]:
+    """Clopper-Pearson two-sided exact binomial CI and one-sided 95% upper bound.
+
+    At ``n_missed == 0``, the one-sided 95% upper bound equals ``1 - 0.05**(1/n)``.
+    Returns ``(cmr, exact_low, exact_high, one_sided_upper)`` in ``[0, 1]``.
+    """
+    if n_defective <= 0:
+        return (0.0, 0.0, 0.0, 0.0)
+
+    k = int(n_missed)
+    n = int(n_defective)
+    p_hat = k / n
+
+    from scipy.stats import beta as _beta
+    alpha_c = 1.0 - confidence
+    ci_low = 0.0 if k == 0 else float(_beta.ppf(alpha_c / 2.0, k, n - k + 1))
+    ci_high = 1.0 if k >= n else float(_beta.ppf(1.0 - alpha_c / 2.0, k + 1, n - k))
+
+    if k == 0:
+        upper_1s = float(1.0 - alpha_c ** (1.0 / n))
+    elif k >= n:
+        upper_1s = 1.0
+    else:
+        upper_1s = float(_beta.ppf(confidence, k + 1, n - k))
+
+    return (
+        float(p_hat),
+        float(np.clip(ci_low, 0.0, 1.0)),
+        float(np.clip(ci_high, 0.0, 1.0)),
+        float(np.clip(upper_1s, 0.0, 1.0)),
+    )
+
+
+def compute_wilson_ci_counts(
+    n_missed: int,
+    n_defective: int,
+    confidence: float = 0.95,
+) -> Tuple[float, float, float]:
+    """Wilson score interval from aggregated integer counts."""
+    if n_defective <= 0:
+        return (0.0, 0.0, 0.0)
+    k = int(n_missed)
+    n = int(n_defective)
+    p_hat = k / n
+    from scipy.stats import norm as _norm
+    z = float(_norm.ppf((1.0 + confidence) / 2.0))
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    centre = (p_hat + z2 / (2.0 * n)) / denom
+    spread = z * np.sqrt(p_hat * (1.0 - p_hat) / n + z2 / (4.0 * n * n)) / denom
+    return (
+        float(p_hat),
+        float(np.clip(centre - spread, 0.0, 1.0)),
+        float(np.clip(centre + spread, 0.0, 1.0)),
+    )
+
+
+def compute_cmr_exact_ci(
+    df: pd.DataFrame,
+    selected_mask: np.ndarray,
+    confidence: float = 0.95,
+) -> Tuple[float, float, float, float]:
+    """Clopper-Pearson exact binomial CI + one-sided upper bound for CMR.
+
+    Returns ``(cmr, exact_low, exact_high, one_sided_upper)``.
+    """
+    indicators = _commit_miss_indicators(df, selected_mask)
+    return compute_exact_binomial_ci_counts(
+        int(indicators.sum()), len(indicators), confidence=confidence
+    )
+
+
 def compute_cmr_wilson_ci(
     df: pd.DataFrame,
     selected_mask: np.ndarray,
@@ -127,22 +203,9 @@ def compute_cmr_wilson_ci(
     Returns ``(cmr, ci_low, ci_high)`` tuple, all in ``[0, 1]``.
     """
     indicators = _commit_miss_indicators(df, selected_mask)
-    n = len(indicators)
-    if n == 0:
-        return (0.0, 0.0, 0.0)
-
-    p_hat = float(indicators.mean())
-
-    from scipy.stats import norm as _norm
-    z = float(_norm.ppf((1.0 + confidence) / 2.0))
-    z2 = z * z
-    denom = 1.0 + z2 / n
-    centre = (p_hat + z2 / (2.0 * n)) / denom
-    spread = z * np.sqrt(p_hat * (1.0 - p_hat) / n + z2 / (4.0 * n * n)) / denom
-    ci_low = float(np.clip(centre - spread, 0.0, 1.0))
-    ci_high = float(np.clip(centre + spread, 0.0, 1.0))
-
-    return (p_hat, ci_low, ci_high)
+    return compute_wilson_ci_counts(
+        int(indicators.sum()), len(indicators), confidence=confidence
+    )
 
 
 def compute_cmr_block_bootstrap_ci(
@@ -184,14 +247,12 @@ def compute_cmr_block_bootstrap_ci(
     return (p_hat, ci_low, ci_high)
 
 
-def compute_budget_saved(
+def _filtered_observed_df_and_mask(
     df: pd.DataFrame,
     selected_mask: np.ndarray,
     duration_col: str = "actual_duration",
-) -> Dict[str, float]:
-    """Budget usage: fraction of tests selected and duration saved over the
-    observed space (excluding any missing/unobserved rows with NaN labels or NaN duration).
-    """
+) -> Tuple[pd.DataFrame, np.ndarray]:
+    """Filter out rows with NaN labels or NaN durations consistently with budget computation."""
     df_valid, mask_valid = _drop_missing_labels(df, selected_mask)
     if duration_col in df_valid.columns:
         dur_valid = df_valid[duration_col].notna().values
@@ -203,6 +264,18 @@ def compute_budget_saved(
         mask_valid = np.zeros(len(df_valid), dtype=bool)
     else:
         mask_valid = np.asarray(mask_valid, dtype=bool)
+    return df_valid, mask_valid
+
+
+def compute_budget_saved(
+    df: pd.DataFrame,
+    selected_mask: np.ndarray,
+    duration_col: str = "actual_duration",
+) -> Dict[str, float]:
+    """Budget usage: fraction of tests selected and duration saved over the
+    observed space (excluding any missing/unobserved rows with NaN labels or NaN duration).
+    """
+    df_valid, mask_valid = _filtered_observed_df_and_mask(df, selected_mask, duration_col)
 
     n_total = len(df_valid)
     n_selected = int(mask_valid.sum())
@@ -225,25 +298,18 @@ def compute_budget_saved(
     }
 
 
-def compute_ttff(
+def compute_ttff_stats(
     df: pd.DataFrame,
     duration_col: str = "actual_duration",
-) -> float:
-    """Time-To-First-Failure (simulated sequential execution time in seconds).
+) -> Dict[str, float]:
+    """Compute mean, median, and 90th percentile of Time-To-First-Failure (TTFF)
+    over detected defective commits (simulated sequential execution in ``_rank`` order).
 
-    For each defective commit where >= 1 failure is selected:
-      * Tests are executed sequentially in ``_rank`` order (no parallel workers).
-      * ``TTFF_c = sum(actual_duration)`` for ranks 1 .. r where *r* is the
-        rank of the **first** test with ``label == 1``.
-
-    Returns mean TTFF (seconds) over all detected defective commits, or ``NaN``
-    if no failures were detected.
-
-    **Conditional metric** — always report alongside CMR.
+    Returns ``{"mean": ..., "median": ..., "p90": ...}``, with ``NaN`` if none detected.
     """
     df_valid, _ = _drop_missing_labels(df)
     scores: list[float] = []
-    for cid, grp in df_valid.groupby("commit_idx"):
+    for _, grp in df_valid.groupby("commit_idx"):
         failures = grp[grp["label"] == 1]
         if len(failures) == 0:
             continue
@@ -256,7 +322,25 @@ def compute_ttff(
         )
         scores.append(float(ttff_c))
 
-    return float(np.mean(scores)) if scores else float("nan")
+    if not scores:
+        return {"mean": float("nan"), "median": float("nan"), "p90": float("nan")}
+    arr = np.asarray(scores, dtype=float)
+    return {
+        "mean": float(np.mean(arr)),
+        "median": float(np.median(arr)),
+        "p90": float(np.percentile(arr, 90)),
+    }
+
+
+def compute_ttff(
+    df: pd.DataFrame,
+    duration_col: str = "actual_duration",
+) -> float:
+    """Mean Time-To-First-Failure (simulated sequential execution time in seconds).
+
+    **Conditional metric** — always report alongside CMR.
+    """
+    return compute_ttff_stats(df, duration_col=duration_col)["mean"]
 
 
 def compute_apfdc(
@@ -486,8 +570,131 @@ def baseline_threshold_target_recall(
 
 
 # ---------------------------------------------------------------------------
-# Unified evaluator
+# Unified evaluator & miss-cause diagnostics
 # ---------------------------------------------------------------------------
+
+def _code_coupling_score(df: pd.DataFrame) -> pd.Series:
+    """Compute heuristic code-coupling proximity score for LatestFail+CC ordering."""
+    score = pd.Series(0.0, index=df.index, dtype=float)
+    weights = (
+        ("test_file_changed", 4.0),
+        ("same_package_changed", 2.0),
+        ("same_module_changed", 1.0),
+        ("path_max_overlap", 2.0),
+        ("co_fail_rate", 2.0),
+    )
+    for col, w in weights:
+        if col in df.columns:
+            score = score + w * df[col].fillna(0.0).astype(float)
+    if "path_min_dist" in df.columns:
+        score = score + (1.0 - df["path_min_dist"].fillna(1.0).astype(float).clip(0.0, 1.0))
+    return score
+
+
+def analyze_miss_causes(
+    df: pd.DataFrame,
+    selected_mask: np.ndarray,
+    probs_test: Optional[np.ndarray] = None,
+) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+    """Break down every missed defective commit into mutually exclusive causes:
+      - ``missing_from_inventory``: no failing test was in ``in_candidate_inventory``
+      - ``empty_prefix``: candidate failure existed, but 0 tests were selected for the commit
+      - ``no_prior_history_low_score``: candidate failure existed with no run history and scored below cutoff
+      - ``score_below_cutoff``: candidate failure had prior run history yet scored below cutoff
+
+    Returns ``(summary_counts, per_commit_records)``.
+    """
+    df_valid, mask_valid = _drop_missing_labels(df, selected_mask)
+    if len(df_valid) == 0:
+        return {
+            "miss_missing_from_inventory": 0,
+            "miss_empty_prefix": 0,
+            "miss_no_prior_history": 0,
+            "miss_score_below_cutoff": 0,
+            "miss_total": 0,
+        }, []
+
+    work = df_valid.copy()
+    work["_sel"] = np.asarray(mask_valid, dtype=bool)
+    cand = _candidate_mask(work)
+    work["_cand"] = cand
+    if probs_test is not None and len(probs_test) == len(df):
+        valid_pos = df["label"].notna().values if "label" in df.columns else np.ones(len(df), dtype=bool)
+        probs_arr = np.asarray(probs_test, dtype=float)[valid_pos]
+        work["_prob_eval"] = np.where(cand, probs_arr, 0.0)
+    elif "_prob" in work.columns:
+        work["_prob_eval"] = np.where(cand, work["_prob"].fillna(0.0).astype(float), 0.0)
+    else:
+        work["_prob_eval"] = 0.0
+
+    counts = {
+        "miss_missing_from_inventory": 0,
+        "miss_empty_prefix": 0,
+        "miss_no_prior_history": 0,
+        "miss_score_below_cutoff": 0,
+        "miss_total": 0,
+    }
+    records: list[Dict[str, Any]] = []
+
+    def_groups = work.groupby("commit_idx", sort=True)
+    for cid, grp in def_groups:
+        fail_rows = grp[grp["label"] == 1]
+        if len(fail_rows) == 0:
+            continue
+        if (grp["_sel"] & (grp["label"] == 1)).any():
+            continue  # detected
+
+        counts["miss_total"] += 1
+        cand_rows = grp[grp["_cand"]].copy()
+        cand_fail = fail_rows[fail_rows["_cand"]]
+        noncand_fail = fail_rows[~fail_rows["_cand"]]
+        n_sel_commit = int(grp["_sel"].sum())
+
+        if len(cand_fail) == 0:
+            cause = "missing_from_inventory"
+            counts["miss_missing_from_inventory"] += 1
+            max_prob = 0.0
+            best_rank = np.nan
+            has_hist = False
+        else:
+            if "_sort_name" not in cand_rows.columns:
+                cand_rows["_sort_name"] = cand_rows["testName"].astype(str) if "testName" in cand_rows.columns else ""
+            cand_sorted = cand_rows.sort_values(["_prob_eval", "_sort_name"], ascending=[False, True]).reset_index(drop=True)
+            cand_sorted["_cand_rank"] = np.arange(1, len(cand_sorted) + 1)
+            fail_ranks = cand_sorted.loc[cand_sorted["label"] == 1, "_cand_rank"]
+            best_rank = int(fail_ranks.min()) if len(fail_ranks) > 0 else np.nan
+            max_prob = float(cand_fail["_prob_eval"].max())
+            has_hist = bool(
+                "run_count_total" in cand_fail.columns
+                and (cand_fail["run_count_total"].fillna(0.0) > 0).any()
+            )
+
+            if n_sel_commit == 0:
+                cause = "empty_prefix"
+                counts["miss_empty_prefix"] += 1
+            elif "run_count_total" in cand_fail.columns and not has_hist:
+                cause = "no_prior_history_low_score"
+                counts["miss_no_prior_history"] += 1
+            else:
+                cause = "score_below_cutoff"
+                counts["miss_score_below_cutoff"] += 1
+
+        commit_sha = str(grp["commit"].iloc[0]) if "commit" in grp.columns else str(cid)
+        records.append({
+            "commit": commit_sha,
+            "commit_idx": int(cid),
+            "miss_cause": cause,
+            "n_selected_commit": n_sel_commit,
+            "n_total_cand_commit": int(len(cand_rows)),
+            "n_cand_fail": int(len(cand_fail)),
+            "n_noncand_fail": int(len(noncand_fail)),
+            "max_cand_fail_prob": max_prob,
+            "best_cand_fail_rank": best_rank,
+            "has_history_on_cand_fail": has_hist,
+        })
+
+    return counts, records
+
 
 def evaluate_selection(
     df: pd.DataFrame,
@@ -507,6 +714,8 @@ def evaluate_selection(
     order_by : str
         "prob" for descending probability ordering,
         "cost_aware" for descending (prob / estimated_duration) ordering,
+        "qtf" for ascending historical duration (duration_median_20),
+        "latest_fail_cc" for failure recency + code coupling score,
         "default" for standard test/class name alphabetical ordering (unprioritized),
         "random" for random execution order per commit,
         "recently_failed" for execution order sorted by recency of failure (last_fail_dist).
@@ -531,6 +740,36 @@ def evaluate_selection(
             df_selected = df_selected.sort_values(
                 ["commit_idx", "_ordering_key", "_sort_name"],
                 ascending=[True, False, True],
+            )
+        elif order_by == "qtf":
+            col = est_duration_col if est_duration_col in df_selected.columns else "duration_mean"
+            dur_qtf = (
+                df_selected[col].astype(float)
+                if col in df_selected.columns
+                else pd.Series(np.nan, index=df_selected.index)
+            )
+            df_selected["_qtf_key"] = dur_qtf.fillna(np.inf)
+            df_selected = df_selected.sort_values(
+                ["commit_idx", "_qtf_key", "_sort_name"],
+                ascending=[True, True, True],
+            )
+        elif order_by == "latest_fail_cc":
+            if "last_fail_dist" in df_selected.columns:
+                dist = df_selected["last_fail_dist"].apply(
+                    lambda x: 1e9 if pd.isna(x) or x <= 0 else float(x)
+                )
+            else:
+                dist = pd.Series(1e9, index=df_selected.index)
+            df_selected["_dist_key"] = dist
+            df_selected["_fr_key"] = (
+                df_selected["fail_rate_20"].fillna(0.0).astype(float)
+                if "fail_rate_20" in df_selected.columns
+                else 0.0
+            )
+            df_selected["_cc_key"] = _code_coupling_score(df_selected)
+            df_selected = df_selected.sort_values(
+                ["commit_idx", "_dist_key", "_cc_key", "_fr_key", "_sort_name"],
+                ascending=[True, True, False, False, True],
             )
         elif order_by == "default":
             df_selected = df_selected.sort_values(
@@ -582,16 +821,35 @@ def evaluate_selection(
     else:
         df_selected["_rank"] = 1
 
-    cmr = compute_cmr(df_work, selected_mask)
-    _, cmr_ci_low, cmr_ci_high = compute_cmr_wilson_ci(df_work, selected_mask)
+    indicators = _commit_miss_indicators(df_work, selected_mask)
+    n_def_commits = int(len(indicators))
+    n_missed_commits = int(indicators.sum())
+    cmr = n_missed_commits / n_def_commits if n_def_commits > 0 else 0.0
+    _, cmr_ci_low, cmr_ci_high = compute_wilson_ci_counts(n_missed_commits, n_def_commits)
+    _, cmr_exact_low, cmr_exact_high, cmr_upper_95 = compute_exact_binomial_ci_counts(
+        n_missed_commits, n_def_commits
+    )
     _, cmr_boot_low, cmr_boot_high = compute_cmr_block_bootstrap_ci(
         df_work, selected_mask, block_size=5, n_bootstrap=500, rng=np.random.default_rng(42)
     )
     budget = compute_budget_saved(df_work, selected_mask, duration_col)
-    ttff = compute_ttff(df_selected, duration_col) if len(df_selected) > 0 else float("nan")
+    df_obs_b, mask_obs_b = _filtered_observed_df_and_mask(df_work, selected_mask, duration_col)
+    if duration_col in df_obs_b.columns:
+        dur_vals_b = df_obs_b[duration_col].fillna(0.0).values
+        total_dur_obs = float(dur_vals_b.sum())
+        sel_dur_obs = float(dur_vals_b[mask_obs_b].sum())
+    else:
+        total_dur_obs = float(len(df_obs_b))
+        sel_dur_obs = float(mask_obs_b.sum())
+
+    ttff_stats = (
+        compute_ttff_stats(df_selected, duration_col)
+        if len(df_selected) > 0
+        else {"mean": float("nan"), "median": float("nan"), "p90": float("nan")}
+    )
     cond_apfdc = compute_conditional_apfdc(df_selected, duration_col) if len(df_selected) > 0 else float("nan")
 
-    df_valid_labels, _ = _drop_missing_labels(df_work)
+    miss_summary, _ = analyze_miss_causes(df_work, selected_mask, probs_test=df_work["_prob"].values)
 
     return {
         "method": method_name,
@@ -599,18 +857,29 @@ def evaluate_selection(
         "cmr": cmr,
         "cmr_ci_low": cmr_ci_low,
         "cmr_ci_high": cmr_ci_high,
+        "cmr_exact_ci_low": cmr_exact_low,
+        "cmr_exact_ci_high": cmr_exact_high,
+        "cmr_upper_95": cmr_upper_95,
         "cmr_boot_ci_low": cmr_boot_low,
         "cmr_boot_ci_high": cmr_boot_high,
         "pct_tests_selected": budget["pct_tests_selected"],
         "pct_duration_selected": budget["pct_duration_selected"],
         "pct_duration_saved": budget["pct_duration_saved"],
-        "ttff": ttff,
+        "total_test_duration": total_dur_obs,
+        "selected_test_duration": sel_dur_obs,
+        "n_obs_pairs": int(len(df_obs_b)),
+        "n_selected_obs_pairs": int(mask_obs_b.sum()),
+        "ttff": ttff_stats["mean"],
+        "ttff_median": ttff_stats["median"],
+        "ttff_p90": ttff_stats["p90"],
         "apfdc": cond_apfdc,
         "conditional_apfdc": cond_apfdc,
-        "n_defective_commits": int(
-            df_valid_labels[df_valid_labels["label"] == 1].groupby("commit_idx").ngroups
-            if "commit_idx" in df_valid_labels.columns and len(df_valid_labels) > 0 else 0
-        ),
+        "n_defective_commits": n_def_commits,
+        "n_missed_defective_commits": n_missed_commits,
+        "miss_missing_from_inventory": miss_summary["miss_missing_from_inventory"],
+        "miss_empty_prefix": miss_summary["miss_empty_prefix"],
+        "miss_no_prior_history": miss_summary["miss_no_prior_history"],
+        "miss_score_below_cutoff": miss_summary["miss_score_below_cutoff"],
         "n_total_pairs": len(df),
         "n_selected": int(selected_mask.sum()),
     }
@@ -640,22 +909,31 @@ def compare_all_methods(
     df_test_p = df_test.copy()
     df_test_p["_prob"] = probs_eval
 
-    # 1. Retest-all (full CI suite reference without test selection)
+    # 1. Retest-all (full CI suite references without test selection)
     mask_all = baseline_retest_all(df_test)
     results.append(evaluate_selection(
         df_test_p, mask_all, "retest_all", alpha, duration_col, order_by="default"
     ))
+    results.append(evaluate_selection(
+        df_test_p, mask_all, "qtf", alpha, duration_col, order_by="qtf"
+    ))
+    results.append(evaluate_selection(
+        df_test_p, mask_all, "latest_fail_cc", alpha, duration_col, order_by="latest_fail_cc"
+    ))
 
-    # 2. Global conformal (probability ordering; strictly within candidate inventory)
+    # 2. Global conformal (probability ordering; primary marginal conformal method)
     sel_global = select_tests_global(df_test, probs_eval, threshold_global)
     mask_global = df_test.index.isin(sel_global.index) & cand_mask
     results.append(evaluate_selection(
         df_test_p, mask_global, "global_conformal", alpha, duration_col, order_by="prob"
     ))
 
-    # 3. Global conformal (cost-aware ordering: p / duration)
+    # 3. Global conformal (cost-aware p/duration & QTF orderings)
     results.append(evaluate_selection(
         df_test_p, mask_global, "global_conformal_cost_aware", alpha, duration_col, order_by="cost_aware"
+    ))
+    results.append(evaluate_selection(
+        df_test_p, mask_global, "global_conformal_qtf", alpha, duration_col, order_by="qtf"
     ))
 
     # 4. Residual risk conformal (probability ordering; strictly within candidate inventory)
